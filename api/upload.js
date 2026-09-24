@@ -5,8 +5,8 @@ import { handleUpload } from "@vercel/blob/client";
 
 const VIDEO = ["video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "video/x-m4v", "video/x-msvideo", "video/*"];
 
-export default async function handler(request) {
-  if (request.method !== "POST") return new Response("POST only", { status: 405 });
+// Web-standard handler (named method export): receives a Request, returns a Response
+export async function POST(request) {
   try {
     const body = await request.json();
     const json = await handleUpload({
