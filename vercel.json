@@ -1,0 +1,26 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm install",
+  "buildCommand": "node deploy/vercel-build.mjs",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 300,
+      "includeFiles": "src/**",
+      "excludeFiles": "{demo,tests,jobs,dist,node_modules,.venv}/**"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/((?!upload$).*)", "destination": "/api/index" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+      ]
+    }
+  ]
+}

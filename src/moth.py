@@ -12,7 +12,7 @@ The otoc-echo-v1 params schema is not pinned here: it is fetched from GET /engin
 only the circuit fields it declares are sent.
 """
 from __future__ import annotations
-import os, pathlib, threading, time
+import hashlib, os, pathlib, threading, time
 from typing import Callable, Optional
 
 import httpx
@@ -21,13 +21,21 @@ from echo_ir import EchoIR
 
 BASE = os.environ.get("MOTH_API_URL", "https://api.mothquantum.com").rstrip("/") + "/api/v1"
 ECHO_ENGINE = os.environ.get("MOTH_ECHO_ENGINE", "otoc-echo-v1")
-POLL_S, TIMEOUT_S = 3.0, float(os.environ.get("MOTH_TIMEOUT_S", 45 * 60))
+# on Vercel a render is one function call (max 300 s on Hobby), so a Moth job must finish well inside it
+POLL_S, TIMEOUT_S = 3.0, float(os.environ.get("MOTH_TIMEOUT_S", 200 if os.environ.get("VERCEL") else 45 * 60))
 TRANSPORT: Optional[httpx.BaseTransport] = None        # tests swap in httpx.MockTransport
 
 _lock = threading.Lock()
-_key: Optional[str] = None
-_state = {"state": "off", "account": None, "source": None, "message": None}
-_schema: Optional[dict] = None
+_server_key: Optional[str] = None          # MOTH_API_KEY: local dev only, never used when public()
+_server_state = {"state": "off", "account": None, "message": None}
+_valid: dict = {}                          # sha256(key) -> (account, expires): keys themselves are not kept
+_schemas: dict = {}                        # sha256(key) -> params_schema
+VALID_TTL_S = 600
+
+
+def public() -> bool:
+    """Public deployment: every visitor brings their own key; the server never holds one."""
+    return os.environ.get("RCV_PUBLIC") == "1" or os.environ.get("VERCEL") == "1"
 
 
 class MothError(Exception):
@@ -64,8 +72,6 @@ def _detail(r: httpx.Response) -> str:
 
 def _check(r: httpx.Response) -> httpx.Response:
     if r.status_code == 401:
-        with _lock:
-            _state.update(state="bad", message="key rejected by moth")
         raise MothError("moth_unauthorized", "Moth rejected the API key (invalid, disabled or revoked).", 401)
     if r.status_code == 429:
         raise MothError("moth_unavailable", "Moth rate limit reached; try again in a minute.", 429)
@@ -76,22 +82,21 @@ def _check(r: httpx.Response) -> httpx.Response:
     return r
 
 
+def _h(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 # ---------------------------------------------------------------- key
-def status() -> dict:
-    with _lock:
-        return {**_state, "engine": ECHO_ENGINE, "api": BASE}
-
-
-def current_key() -> Optional[str]:
-    with _lock:
-        return _key if _state["state"] == "on" else None
-
-
-def set_key(key: str, source: str = "ui") -> dict:
-    global _key, _schema
+def validate(key: str) -> str:
+    """Check a key with GET /me; returns the account label. Cached briefly by hash only."""
     key = (key or "").strip()
     if not key.startswith("moth_"):
         raise MothError("moth_unauthorized", "Moth keys start with moth_.", 422)
+    h, now = _h(key), time.time()
+    with _lock:
+        hit = _valid.get(h)
+    if hit and hit[1] > now:
+        return hit[0]
     try:
         with _client(key) as c:
             r = c.get("/me")
@@ -99,52 +104,85 @@ def set_key(key: str, source: str = "ui") -> dict:
         raise MothError("moth_unavailable", f"could not reach {BASE}: {type(e).__name__}", 502)
     if r.status_code == 401:
         with _lock:
-            _key, _schema = None, None
-            _state.update(state="bad", account=None, source=source, message="key rejected by moth")
+            _valid.pop(h, None); _schemas.pop(h, None)
         raise MothError("moth_unauthorized", "Moth rejected this key (invalid, disabled or revoked).", 401)
     _check(r)
     me = r.json()
+    account = me.get("email") or me.get("id") or "connected"
     with _lock:
-        _key, _schema = key, None
-        _state.update(state="on", account=me.get("email") or me.get("id"), source=source, message=None)
-    return status()
+        _valid[h] = (account, now + VALID_TTL_S)
+    return account
+
+
+def resolve(key: Optional[str] = None) -> Optional[str]:
+    """The key to use for a request: the visitor's own, else (local dev only) MOTH_API_KEY."""
+    if key and key.strip():
+        return key.strip()
+    if public():
+        return None
+    with _lock:
+        return _server_key if _server_state["state"] == "on" else None
+
+
+def status(key: Optional[str] = None) -> dict:
+    base = {"engine": ECHO_ENGINE, "api": BASE, "public": public()}
+    if key and key.strip():
+        try:
+            return {**base, "state": "on", "account": validate(key), "source": "browser", "message": None}
+        except MothError as e:
+            if e.code != "moth_unauthorized":
+                raise
+            return {**base, "state": "bad", "account": None, "source": "browser", "message": e.message}
+    if public():
+        return {**base, "state": "off", "account": None, "source": None, "message": None}
+    with _lock:
+        s = dict(_server_state)
+    return {**base, **s, "source": "env" if s["state"] != "off" else None}
 
 
 def clear() -> dict:
-    global _key, _schema
+    """Forget the local-dev server key and every cached validation / schema."""
+    global _server_key
     with _lock:
-        _key, _schema = None, None
-        _state.update(state="off", account=None, source=None, message=None)
+        _server_key = None; _valid.clear(); _schemas.clear()
+        _server_state.update(state="off", account=None, message=None)
     return status()
 
 
 def init_from_env() -> None:
+    global _server_key
     k = os.environ.get("MOTH_API_KEY")
-    if not k:
+    if not k or public():
         return
     try:
-        set_key(k, source="env")
+        acct = validate(k)
+        with _lock:
+            _server_key = k.strip(); _server_state.update(state="on", account=acct, message=None)
     except MothError as e:
         with _lock:
-            _state.update(message=e.message)
+            _server_state.update(state="bad" if e.code == "moth_unauthorized" else "off", message=e.message)
 
 
 # ---------------------------------------------------------------- engine
-def engine_schema() -> dict:
-    global _schema
-    key = current_key()
-    if not key:
+def engine_schema(key: Optional[str] = None) -> dict:
+    k = resolve(key)
+    if not k:
         raise MothError("moth_unauthorized", "No Moth key applied.", 401)
-    if _schema is None:
-        with _client(key) as c:
+    h = _h(k)
+    with _lock:
+        hit = _schemas.get(h)
+    if hit is None:
+        with _client(k) as c:
             rec = _check(c.get(f"/engines/{ECHO_ENGINE}")).json()
-        _schema = rec.get("params_schema") or {}
-    return _schema
+        hit = rec.get("params_schema") or {}
+        with _lock:
+            _schemas[h] = hit
+    return hit
 
 
-def options() -> dict:
+def options(key: Optional[str] = None) -> dict:
     """What the UI needs to draw machine / shots selectors, straight from the schema."""
-    props = (engine_schema().get("properties") or {})
+    props = (engine_schema(key).get("properties") or {})
     out = {"engine": ECHO_ENGINE, "fields": sorted(props),
            "describe": {k: {x: v[x] for x in ("type", "default", "enum", "minimum", "maximum", "description") if x in v}
                         for k, v in props.items() if isinstance(v, dict)}}
@@ -207,11 +245,12 @@ def _fetch_result(c: httpx.Client, job_id: str) -> dict:
     raise MothError("moth_failed", "Moth job finished without a trajectory result.")
 
 
-def measure(sim_kwargs: dict, opts: dict, on_status: Callable[[str, float], None] = lambda s, p: None) -> EchoIR:
-    key = current_key()
+def measure(sim_kwargs: dict, opts: dict, on_status: Callable[[str, float], None] = lambda s, p: None,
+            key: Optional[str] = None) -> EchoIR:
+    key = resolve(key)
     if not key:
         raise MothError("moth_unauthorized", "No Moth key applied; add one with the key button.", 401)
-    params = build_params(sim_kwargs, opts, engine_schema())
+    params = build_params(sim_kwargs, opts, engine_schema(key))
     with _client(key) as c:
         sub = _check(c.post(f"/engines/{ECHO_ENGINE}/process", json={"params": params})).json()
         jid = sub["job_id"]

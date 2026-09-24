@@ -6,7 +6,7 @@ command -v ffmpeg >/dev/null || { echo "ffmpeg not found — install it first (m
 if [ ! -d .venv ]; then
   python3 -m venv .venv
   .venv/bin/pip install -q --upgrade pip
-  .venv/bin/pip install -q -r requirements.txt
+  .venv/bin/pip install -q -r requirements-dev.txt
 fi
 PORT="${PORT:-8000}"
 echo "→ http://127.0.0.1:${PORT}"

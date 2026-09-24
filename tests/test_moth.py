@@ -80,9 +80,12 @@ def wait(jid, timeout=120):
     raise TimeoutError
 
 
-def submit(moth_opts):
+KEY = {"X-Moth-Key": GOOD}
+
+
+def submit(moth_opts, headers=KEY, **data):
     return C.post("/process", files={"video": ("clip.mp4", CLIP.read_bytes(), "video/mp4")},
-                  data={"params": json.dumps(FAST), "moth": json.dumps(moth_opts)})
+                  data={"params": json.dumps(FAST), "moth": json.dumps(moth_opts), **data}, headers=headers)
 
 
 def test_starts_off_and_rejects_bad_keys(fake):
@@ -90,28 +93,30 @@ def test_starts_off_and_rejects_bad_keys(fake):
     assert C.post("/moth/key", json={"key": "sk-nope"}).status_code == 422          # wrong prefix, no call made
     r = C.post("/moth/key", json={"key": "moth_revoked"})
     assert r.status_code == 401 and r.json()["error"]["code"] == "moth_unauthorized"
-    assert C.get("/moth").json()["state"] == "bad"
+    assert C.get("/moth", headers={"X-Moth-Key": "moth_revoked"}).json()["state"] == "bad"
 
 
-def test_key_applies_and_is_never_echoed(fake):
+def test_key_is_per_request_and_never_echoed(fake):
     r = C.post("/moth/key", json={"key": GOOD})
     assert r.status_code == 200 and r.json()["state"] == "on" and r.json()["account"] == "a@example.com"
-    for path in ("/moth", "/moth/options", "/"):
-        assert GOOD not in C.get(path).text
-    assert C.delete("/moth/key").json()["state"] == "off"
+    assert C.get("/moth").json()["state"] == "off"                  # validating a key does not store it
+    assert C.get("/moth", headers=KEY).json()["state"] == "on"
+    for path in ("/moth", "/moth/options", "/", "/jobs"):
+        assert GOOD not in C.get(path, headers=KEY).text
+    assert sum(1 for c in fake.calls if c[1].endswith("/me")) == 1  # /me result cached (by hash)
 
 
 def test_options_come_from_engine_schema(fake):
-    C.post("/moth/key", json={"key": GOOD})
-    o = C.get("/moth/options").json()
+    o = C.get("/moth/options", headers=KEY).json()
     assert o["machine"]["enum"] == ["aer", "fake_fez"] and o["shots"]["default"] == 4096
+    assert C.get("/moth/options").status_code == 401
 
 
 def test_moth_measure_then_render(fake):
-    C.post("/moth/key", json={"key": GOOD})
     r = submit({"machine": "fake_fez", "shots": 2000}); assert r.status_code == 202, r.text
     j = wait(r.json()["id"]); assert j["status"] == "succeeded", j
     assert j["ir_source"] == "moth" and j["result"]["data"]["machine"] == "fake_fez"
+    assert GOOD not in json.dumps(C.get(f"/jobs/{j['id']}").json())
     sent = fake.submitted["params"]                       # only schema-declared fields go out
     assert sent["machine"] == "fake_fez" and sent["shots"] == 2000 and sent["n_sites"] == 6
     assert "seed" not in sent and "shape" not in sent and sent["via"] == "mothbackend"
@@ -126,14 +131,12 @@ def test_build_params_maps_square_and_aer():
 
 def test_presigned_output_result(fake):
     fake.finish = "outputs"
-    C.post("/moth/key", json={"key": GOOD})
     j = wait(submit({}).json()["id"]); assert j["status"] == "succeeded", j
     assert ("GET", "/t.json", None) in fake.calls           # presigned url fetched without the key
 
 
 def test_real_nested_result_shape(fake):
     fake.finish = "nested"
-    C.post("/moth/key", json={"key": GOOD})
     j = wait(submit({}).json()["id"]); assert j["status"] == "succeeded", j
     ir = C.get(j["result"]["data"]["files"]["ir"]).json()
     assert ir["data"]["series"]["F_re"] == fake.traj["data"]["series"]["F_re"]
@@ -147,11 +150,58 @@ def test_unwrap_square_width_height():
 
 def test_moth_job_failure_is_typed(fake):
     fake.finish = "fail"
-    C.post("/moth/key", json={"key": GOOD})
     j = wait(submit({}).json()["id"])
     assert j["status"] == "failed" and j["error"]["code"] == "moth_failed" and "qpu offline" in j["error"]["message"]
 
 
 def test_moth_source_needs_a_key(fake):
-    r = submit({})
+    r = submit({}, headers={})
     assert r.status_code == 401 and r.json()["error"]["code"] == "moth_unauthorized"
+
+
+# ---- local dev: MOTH_API_KEY from .env / env is a fallback --------------------------
+def test_env_key_is_a_local_fallback(fake, monkeypatch):
+    monkeypatch.setenv("MOTH_API_KEY", GOOD)
+    moth.init_from_env()
+    s = C.get("/moth").json(); assert s["state"] == "on" and s["source"] == "env"
+    assert submit({}, headers={}).status_code == 202
+    assert C.delete("/moth/key").json()["state"] == "off"
+
+
+# ---- public deployment ----------------------------------------------------------------
+@pytest.fixture
+def public(monkeypatch, fake):
+    monkeypatch.setenv("RCV_PUBLIC", "1")
+    yield fake
+
+
+def test_public_never_uses_a_server_key(public, monkeypatch):
+    monkeypatch.setenv("MOTH_API_KEY", GOOD)
+    moth.init_from_env()                                   # ignored in public mode
+    assert C.get("/moth").json()["state"] == "off"
+    assert submit({}, headers={}).status_code == 401
+    assert C.delete("/moth/key").json()["state"] == "off"
+
+
+def test_public_jobs_are_scoped_to_the_visitor(public):
+    a, b = {**KEY, "X-Client-Id": "visitor-a"}, {"X-Client-Id": "visitor-b"}
+    j = wait(submit({}, headers=a).json()["id"]); assert j["status"] == "succeeded", j
+    assert len(j["id"]) == 32
+    assert [x["id"] for x in C.get("/jobs", headers=a).json()] == [j["id"]]
+    assert C.get("/jobs", headers=b).json() == [] and C.get("/jobs").json() == []
+    assert "client" not in C.get(f"/jobs/{j['id']}").json()
+    ref = f"job:{j['id']}/ir"                              # another visitor cannot reuse your ir
+    r = C.post("/process", files={"video": ("c.mp4", CLIP.read_bytes(), "video/mp4")},
+               data={"params": json.dumps(FAST), "ir_ref": ref}, headers=b)
+    assert r.json()["error"]["code"] == "invalid_ir"
+
+
+def test_job_ids_are_checked():
+    assert C.get("/jobs/..%2F..%2Fetc/files/video").status_code == 404
+    assert C.post("/process", files={"video": ("c.mp4", CLIP.read_bytes(), "video/mp4")},
+                  data={"ir_ref": "job:../../x/ir"}).json()["error"]["code"] == "invalid_ir"
+
+
+def test_config_js_defaults_to_same_origin():
+    r = C.get("/config.js")
+    assert r.status_code == 200 and "RCV_API" in r.text and r.headers["content-type"].startswith("application/javascript")

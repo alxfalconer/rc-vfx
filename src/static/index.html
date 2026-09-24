@@ -302,7 +302,7 @@ td.fail{color:var(--red)}
 <dialog id="mothDlg" aria-labelledby="mothTitle">
   <form id="mothForm" autocomplete="off">
     <h2 id="mothTitle">Moth API key</h2>
-    <p class="note" style="min-height:0">Bring your own key to measure the tap map on Moth with <b>otoc-echo-v1</b>. The key is held in memory by this local server and sent only to the Moth API. It is never stored in the browser.</p>
+    <p class="note" style="min-height:0">Bring your own key to measure the tap map on Moth with <b>otoc-echo-v1</b>. The key stays in this browser tab (cleared when you close it) and is sent only with your own Moth requests, which the RC–VFX server passes straight to the Moth API. The server never stores it.</p>
     <label for="mothKey">api key</label>
     <input type="password" id="mothKey" class="field" spellcheck="false" placeholder="moth_…">
     <p class="dlg-msg" id="mothMsg" role="status"></p>
@@ -431,8 +431,33 @@ td.fail{color:var(--red)}
 </aside>
 </div>
 
+<script src="config.js"></script>
 <script>
 const $ = id => document.getElementById(id);
+/* where the API lives: same origin locally, the container API when the page is served by Vercel */
+const API = (window.RCV_API || "").replace(/\/$/, "");
+const SERVERLESS = window.RCV_MODE === "serverless";      // Vercel: Blob uploads + one /render call, jobs kept in this browser
+const fileUrl = u => /^https?:/.test(u) ? u : API + u;
+const dlUrl = u => /^https?:/.test(u) ? u + "?download=1" : API + u + "?download=true";
+const localJobs = {
+  get(){ try { return JSON.parse(localStorage.getItem("rcv.jobs") || "[]"); } catch (e) { return []; } },
+  add(j){ try { localStorage.setItem("rcv.jobs", JSON.stringify([j, ...this.get().filter(x => x.id !== j.id)].slice(0, 20))); } catch (e) {} },
+};
+const store = {
+  get(k){ try { return sessionStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch (e) {} },
+};
+let mothKey = store.get("rcv.mothKey");           // this tab only: sent with moth requests, never stored server-side
+const clientId = (() => {                          // scopes the job list to this browser on a public deployment
+  const make = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+  try { let id = localStorage.getItem("rcv.client"); if (!id) { id = make(); localStorage.setItem("rcv.client", id); } return id; }
+  catch (e) { return make(); }
+})();
+function api(path, opts = {}){
+  const headers = {...(opts.headers || {}), "X-Client-Id": clientId};
+  if (mothKey && (path.startsWith("/moth") || path === "/process" || path === "/render")) headers["X-Moth-Key"] = mothKey;
+  return fetch(API + path, {...opts, headers});
+}
 const HINTS = {
   invert: "literal: negative taps are subtracted. visible only against dry, so keep mix below 1.",
   negative: "photographic negative of the delayed frame. visible at any mix; on dark footage it floods with light.",
@@ -550,7 +575,7 @@ function params(){
 
 let estT;
 function estimate(){ clearTimeout(estT); estT = setTimeout(async () => {
-  const r = await fetch("/estimate", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(params())});
+  const r = await api("/estimate", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(params())});
   const j = await r.json();
   $("estimate").textContent = r.ok
     ? `${j.taps} live taps · ~${j.output_seconds.toFixed(1)} s out for a 6 s clip${j.warnings.length ? " · " + j.warnings[0] : ""}`
@@ -613,7 +638,48 @@ function loaderFrame(now){
 function loader(on){ cancelAnimationFrame(ldRaf); LD.hidden = !on;
   if (on) { ldT0 = performance.now(); ldRaf = requestAnimationFrame(loaderFrame); } }
 
+/* serverless: clips go browser → Vercel Blob, then one /render call does measure + render + store */
+let blobUpload = null;
+async function toBlob(file, label){
+  blobUpload = blobUpload || (await import("https://esm.sh/@vercel/blob@2.8.0/client")).upload;
+  const name = "clips/" + file.name.replace(/[^\w.\- ]+/g, "_").slice(-100);
+  const b = await blobUpload(name, file, {
+    access: "public", handleUploadUrl: API + "/upload", multipart: file.size > 20 * 1048576,
+    onUploadProgress: e => { const pc = e.percentage || 0; readout(pc / 100, true); $("status").innerHTML = `uploading ${label} · ${Math.round(pc)}%`; },
+  });
+  return b.url;
+}
+async function renderServerless(){
+  const src = document.querySelector("input[name=irsrc]:checked").value;
+  busy(true); readout(0, true); $("status").innerHTML = "uploading…";
+  try {
+    const body = { params: params() };
+    body.video_url = await toBlob(vid.files[0], "A");
+    if (echoFile) body.echo_url = await toBlob(echoFile, "B");
+    if (src === "upload" && $("irfile").files[0]) body.ir = JSON.parse(await $("irfile").files[0].text());
+    if (src === "job" && $("irref").value) body.ir_url = $("irref").value;
+    if (src === "moth") body.moth = mothOpts();
+    readout(0, true); $("status").innerHTML = src === "moth" ? "measuring on moth, then rendering…" : "rendering…";
+    const r = await api("/render", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const j = await r.json().catch(() => ({error: {code: r.status === 504 ? "timeout" : "render_failed",
+      message: r.status === 504 ? "the render ran past the function time limit; try a shorter clip or lower max height" : `server error ${r.status}`}}));
+    if (j.id) { localJobs.add(j); refreshJobs(); }
+    if (!r.ok || j.status !== "succeeded") {
+      const e = j.error || {}; readout(0, false);
+      $("status").innerHTML = `<span class="err">${e.code || r.status}: ${e.message || "render failed"}</span>`; return;
+    }
+    readout(1, false);
+    $("rTaps").textContent = j.taps ?? "—"; $("rFrames").textContent = j.frames_total ? `${j.frames_done}/${j.frames_total}` : "—";
+    $("rTime").textContent = j.render_s ? `${j.render_s}s` : "—";
+    $("status").innerHTML = `job <b>${j.id.slice(0, 12)}</b> · done`;
+    show(j);
+  } catch (e) {
+    readout(0, false); $("status").innerHTML = `<span class="err">${e.message || e}</span>`;
+  } finally { busy(false); }
+}
+
 $("go").onclick = async () => {
+  if (SERVERLESS) return renderServerless();
   const fd = new FormData(); fd.append("video", vid.files[0]); fd.append("params", JSON.stringify(params()));
   if (echoFile) fd.append("echo", echoFile);
   const src = document.querySelector("input[name=irsrc]:checked").value;
@@ -621,13 +687,13 @@ $("go").onclick = async () => {
   if (src === "job" && $("irref").value) fd.append("ir_ref", $("irref").value);
   if (src === "moth") fd.append("moth", JSON.stringify(mothOpts()));
   busy(true); readout(0, true); $("status").innerHTML = "uploading…";
-  const r = await fetch("/process", {method:"POST", body: fd}); const j = await r.json();
+  const r = await api("/process", {method:"POST", body: fd}); const j = await r.json();
   if (!r.ok) { $("status").innerHTML = `<span class="err">${j.error ? j.error.code + ": " + j.error.message : r.status}</span>`; busy(false); readout(0, false); return; }
   poll(j.id);
 };
 
 function poll(id){ clearInterval(polling); polling = setInterval(async () => {
-  const j = await (await fetch(`/jobs/${id}`)).json();
+  const j = await (await api(`/jobs/${id}`)).json();
   const done = j.status === "succeeded" || j.status === "failed";
   readout(j.progress || 0, !done);
   $("rTaps").textContent = j.taps ?? "—";
@@ -639,19 +705,21 @@ function poll(id){ clearInterval(polling); polling = setInterval(async () => {
 
 function show(j){
   const f = j.result.data.files, bust = `?t=${Date.now()}`;
-  $("screen").innerHTML = `<video data-kind="result" src="${f.video}${bust}" controls autoplay loop muted playsinline></video>`;
-  $("files").innerHTML = [["video","video.mp4"],["ir","ir.json"],["taps","taps.json"],["spacetime","spacetime.png"]].map(([k,n]) => `<a class="te-key" href="${f[k]}?download=true" download>${n}</a>`).join("");
+  $("screen").innerHTML = `<video data-kind="result" src="${fileUrl(f.video)}${SERVERLESS ? "" : bust}" controls autoplay loop muted playsinline></video>`;
+  $("files").innerHTML = [["video","video.mp4"],["ir","ir.json"],["taps","taps.json"],["spacetime","spacetime.png"]].map(([k,n]) => `<a class="te-key" href="${dlUrl(f[k])}" download>${n}</a>`).join("");
   $("warns").innerHTML = (j.warnings||[]).map(w => `<p class="warn">${w}</p>`).join("");
   if (j.taps) $("rTaps").textContent = j.taps;
 }
 
 async function refreshJobs(){
-  const js = await (await fetch("/jobs")).json();
-  $("jobs").innerHTML = js.slice(0, 12).map(j => `<tr class="pick" data-id="${j.id}"><td>${j.id}</td><td class="${j.status==='succeeded'?'ok':j.status==='failed'?'fail':''}">${j.status}</td><td>${j.ir_source}${j.cross_echo ? " · a×b" : ""}</td><td>${j.taps ?? ""} taps</td></tr>`).join("")
+  const js = SERVERLESS ? localJobs.get() : await (await api("/jobs")).json();
+  const ref = j => SERVERLESS ? (j.result?.data?.ir_ref || "") : `job:${j.id}/ir`;
+  $("jobs").innerHTML = js.slice(0, 12).map(j => `<tr class="pick" data-id="${j.id}"><td>${j.id.slice(0, 12)}</td><td class="${j.status==='succeeded'?'ok':j.status==='failed'?'fail':''}">${j.status}</td><td>${j.ir_source}${j.cross_echo ? " · a×b" : ""}</td><td>${j.taps ?? ""} taps</td></tr>`).join("")
     || `<tr><td class="empty-note" style="border:0">no jobs yet</td></tr>`;
   document.querySelectorAll("tr.pick").forEach(tr => tr.onclick = async () => {
-    const j = await (await fetch(`/jobs/${tr.dataset.id}`)).json(); if (j.status === "succeeded") show(j); });
-  $("irref").innerHTML = js.filter(j => j.status === "succeeded").map(j => `<option value="job:${j.id}/ir">job:${j.id}/ir</option>`).join("") || "<option value=''>no finished jobs yet</option>";
+    const j = SERVERLESS ? localJobs.get().find(x => x.id === tr.dataset.id) : await (await api(`/jobs/${tr.dataset.id}`)).json();
+    if (j && j.status === "succeeded") show(j); });
+  $("irref").innerHTML = js.filter(j => j.status === "succeeded" && ref(j)).map(j => `<option value="${ref(j)}">job:${j.id.slice(0, 12)}/ir</option>`).join("") || "<option value=''>no finished jobs yet</option>";
 }
 refreshJobs();
 
@@ -671,13 +739,13 @@ function setBadge(s){
   if (st === "on" && !mothOptsLoaded) loadMothOptions();
 }
 async function checkMoth(){
-  try { setBadge(await (await fetch("/moth")).json()); } catch (e) { setBadge({state: "off"}); }
+  try { setBadge(await (await api("/moth")).json()); } catch (e) { setBadge({state: "off"}); }
 }
 function fillSelect(sel, values, dflt){
   sel.innerHTML = values.map(v => `<option${String(v) === String(dflt) ? " selected" : ""}>${v}</option>`).join("");
 }
 async function loadMothOptions(){
-  const r = await fetch("/moth/options"); if (!r.ok) return;
+  const r = await api("/moth/options"); if (!r.ok) return;
   const o = await r.json(); mothOptsLoaded = true;
   const m = o.machine || o.backend_name;
   $("machineRow").hidden = !m;
@@ -707,14 +775,19 @@ $("mothForm").onsubmit = async e => {
   const key = $("mothKey").value.trim(); if (!key) { mothMsg("paste a key first", "err"); return; }
   $("mothApply").disabled = true; mothMsg("checking with moth…");
   try {
-    const r = await fetch("/moth/key", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({key})});
+    const r = await fetch(API + "/moth/key", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({key})});
     const j = await r.json();
-    if (r.ok) { $("mothKey").value = ""; setBadge(j); mothMsg(`applied · ${j.account || "connected"}`, "ok"); setTimeout(() => dlg.close(), 900); }
-    else { mothMsg(j.error ? j.error.message : `error ${r.status}`, "err"); if (j.moth) setBadge(j.moth); }
-  } catch (err) { mothMsg("could not reach the local server", "err"); }
+    if (r.ok) { mothKey = key; store.set("rcv.mothKey", key); $("mothKey").value = ""; mothOptsLoaded = false;
+      setBadge(j); mothMsg(`applied · ${j.account || "connected"}`, "ok"); setTimeout(() => dlg.close(), 900); }
+    else { mothMsg(j.error ? j.error.message : `error ${r.status}`, "err"); if (r.status === 401) setBadge({state: "bad"}); }
+  } catch (err) { mothMsg("could not reach the server", "err"); }
   $("mothApply").disabled = false;
 };
-$("mothClear").onclick = async () => { setBadge(await (await fetch("/moth/key", {method:"DELETE"})).json()); mothOptsLoaded = false; mothMsg("key removed"); };
+$("mothClear").onclick = async () => {
+  mothKey = null; store.set("rcv.mothKey", null); mothOptsLoaded = false;
+  try { setBadge(await (await api("/moth/key", {method:"DELETE"})).json()); } catch (e) { setBadge({state: "off"}); }
+  mothMsg("key removed");
+};
 checkMoth();
 
 /* viewer: expand in the page, or go full screen */
