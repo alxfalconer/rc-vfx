@@ -11,6 +11,9 @@
       "excludeFiles": "{demo,tests,jobs,dist,node_modules,.venv}/**"
     }
   },
+  "crons": [
+    { "path": "/api/cleanup", "schedule": "0 4 * * *" }
+  ],
   "rewrites": [
     { "source": "/api/((?!upload$).*)", "destination": "/api/index" }
   ],

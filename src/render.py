@@ -26,6 +26,18 @@ import cv2
 from echo_ir import EchoIR
 
 MODES = ("invert", "negative", "reverse", "phase")
+BLENDS = ("average", "add", "screen", "lighten", "difference")
+
+
+def soft_clip(x, knee=0.8):
+    """Identity below `knee`, then a tanh shoulder that approaches 1: lets echoes run hot
+    (punch, add/screen, runaway feedback) without flattening into white."""
+    x = np.maximum(x, 0)
+    over = x > knee
+    if not over.any():
+        return x
+    top = 1.0 - knee
+    return np.where(over, knee + top * np.tanh((x - knee) / top), x).astype(np.float32)
 
 
 # ---------- colour -------------------------------------------------------------
@@ -81,12 +93,30 @@ class RenderParams:
     min_level: float = 0.02
     tail_s: float | None = None      # None = auto
     max_tail_s: float = 10.0
+    # --- expressive layer (all off by default = the faithful renderer) ---------------
+    blend: str = "average"           # how wet meets dry: average | add | screen | lighten | difference
+    punch: float = 0.0               # 0 = wet normalised by summed level; 1 = by the strongest tap (+ soft clip)
+    sparsity: int = 0                # keep only the K strongest taps (0 = all)
+    zoom: float = 0.0                # tap t is scaled by 1 + zoom * t/T about the kick site
+    spin: float = 0.0                # tap t is rotated by spin * 30deg * t/T * sign(F)  (phase: * arg F)
+    fb_zoom: float = 0.0             # feedback bus: scale per pass (the tunnel)
+    fb_spin: float = 0.0             # feedback bus: degrees per pass
+    fb_hue: float = 0.0              # feedback bus: chroma rotation per pass, radians
+    chroma_split: float = 0.0        # R reads older, B newer frames, proportional to tap delay
+    stutter: float = 0.0             # chance a tap group drops out, per depth step (strong taps survive)
+    stutter_seed: int = 0
+    fb_crossfade: bool = False       # feedback as (1-f)*input + f*bus (video-synth style) instead of input + f*bus
+    accumulate: str = "sum"          # "sum" (faithful) | "max": each echo copy at full strength, per-pixel max
 
     def validate(self):
         if self.negative_mode not in MODES:
             raise ValueError(f"negative_mode must be one of {MODES}")
-        if not 0 <= self.feedback < 1:
-            raise ValueError("feedback must be in [0, 1)")
+        if self.accumulate not in ("sum", "max"):
+            raise ValueError("accumulate must be sum or max")
+        if self.blend not in BLENDS:
+            raise ValueError(f"blend must be one of {BLENDS}")
+        if not 0 <= self.feedback < 1.25:
+            raise ValueError("feedback must be in [0, 1.25)")
         if not 0 <= self.mix <= 1:
             raise ValueError("mix must be in [0, 1]")
 
@@ -102,6 +132,8 @@ class Tap:
     x: float
     y: float
     shift_px: tuple = (0.0, 0.0)
+    scale: float = 1.0
+    rotate: float = 0.0              # degrees
 
 
 def _pou_weights(centres, n_px):
@@ -155,8 +187,15 @@ class VideoEcho:
                 frac = t / ir.depth
                 shift = (p.drift * (x - kx) * frac * self.W,
                          p.drift * (y - ky) * frac * self.H if ir.lattice == "square" else 0.0)
-                taps.append(Tap(i, t, d, float(level), 1 if f.real >= 0 else -1, float(np.angle(f)),
-                                xw, yw, shift))
+                sign = 1 if f.real >= 0 else -1
+                # expressive: deeper taps zoom further; rotation follows the tap's sign (phase: arg F)
+                rot = (p.spin * math.degrees(np.angle(f)) / 6 if p.negative_mode == "phase"
+                       else p.spin * 30.0 * frac * sign)
+                taps.append(Tap(i, t, d, float(level), sign, float(np.angle(f)), xw, yw, shift,
+                                scale=round(1.0 + p.zoom * frac, 3), rotate=round(rot, 1)))
+        if p.sparsity and len(taps) > p.sparsity:            # fewer, stronger echoes read as distinct copies
+            keep = set(id(t) for t in sorted(taps, key=lambda t: -t.level)[:p.sparsity])
+            taps = [t for t in taps if id(t) in keep]
         return taps
 
     def _build_windows(self):
@@ -175,12 +214,25 @@ class VideoEcho:
         # normalise wet so the loudest pixel's total |level| is 1: no blow-out, sign structure kept
         total = sum(self.win[id(t)] * t.level for t in self.taps) + np.zeros((1, self.W, 1), np.float32)
         self.wet_gain = 1.0 / float(total.max())
+        if p.punch > 0 or p.accumulate == "max":   # toward "every echo copy at full strength"
+            per_delay = {}                           # an echo copy = all taps landing on the same delay
+            for t in self.taps:
+                per_delay[t.delay] = per_delay.get(t.delay, 0) + self.win[id(t)] * t.level
+            strongest = 1.0 / max(float(np.max(v)) for v in per_delay.values())
+            # max-accumulation never stacks copies, so it can take the full per-copy gain
+            k = 1.0 if p.accumulate == "max" else p.punch
+            self.wet_gain = self.wet_gain ** (1 - k) * strongest ** k
+        self._black = np.zeros((self.H, self.W, 3), np.float32)
+        kx, ky = self.ir.site_xy(self.ir.kick_site)       # zoom / spin / feedback transforms pivot on the butterfly
+        self.pivot = (kx * self.W, (ky if self.ir.lattice == "square" else 0.5) * self.H)
         src = [t for t in self.taps if p.feedback_source == "all" or t.site == self.ir.kick_site]
         if p.feedback > 0 and not src:
             self.warnings.append("feedback_source has no live taps; feedback disabled.")
         s = sum(t.level for t in src) or 1.0
         self.fb_taps = [(t, t.level / s) for t in src] if p.feedback > 0 else []
         self.max_delay = max(t.delay for t in self.taps) + p.grain_frames
+        if p.chroma_split > 0:                                   # the red channel reaches further back
+            self.max_delay += int(round(p.chroma_split * 0.35 * self.max_delay)) + 1
 
     # -- grouping: taps sharing a delay read the same frame -> one weight map each -------
     def _groups(self, taps_weights):
@@ -192,7 +244,7 @@ class VideoEcho:
         g = {}
         phase = self.p.negative_mode == "phase"
         for t, w in taps_weights:
-            shift = (round(t.shift_px[0], 1), round(t.shift_px[1], 1))
+            shift = (round(t.shift_px[0], 1), round(t.shift_px[1], 1), t.scale, t.rotate)
             if phase:                                   # (luminance map, chroma map)
                 key = (t.delay, "lab", shift)
                 Lm, Cm = g.get(key, (0, 0))
@@ -219,10 +271,13 @@ class VideoEcho:
         return k
 
     def _shift(self, img, shift):
-        dx, dy = shift
-        if abs(dx) < 0.5 and abs(dy) < 0.5:
+        """shift = (dx, dy[, scale, degrees]): one affine warp about the kick site."""
+        dx, dy = shift[0], shift[1]
+        s, a = (shift[2], shift[3]) if len(shift) > 2 else (1.0, 0.0)
+        if abs(dx) < 0.5 and abs(dy) < 0.5 and abs(s - 1) < 1e-3 and abs(a) < 0.05:
             return img
-        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        M = cv2.getRotationMatrix2D(self.pivot, a, s)
+        M[0, 2] += dx; M[1, 2] += dy
         return cv2.warpAffine(img, M, (self.W, self.H), flags=cv2.INTER_LINEAR,
                               borderMode=cv2.BORDER_REFLECT)
 
@@ -236,18 +291,29 @@ class VideoEcho:
                 lab = fetch(n - d, "lab")
                 if lab is None:
                     continue
-                if sh != (0.0, 0.0):
-                    lab = self._shift(lab, sh)
+                lab = self._shift(lab, sh)
                 L += sq(Lm) * lab[..., 0]                # luminance: sum of |F| levels, unrotated
                 Z += sq(Cm) * (lab[..., 1] + 1j * lab[..., 2])   # chroma multiplied by F
             return L, Z
         acc = np.zeros((self.H, self.W, 3), np.float32)
+        cs = self.p.chroma_split
         for (d, kind, sh), m in groups.items():
             k = self._src_index(n, d, kind)
-            img = fetch(k, "negimg" if (kind == "neg" and self.p.negative_mode == "negative") else "lin")
-            if img is None:
+            form = "negimg" if (kind == "neg" and self.p.negative_mode == "negative") else "lin"
+            img = fetch(k, form)
+            if cs > 0:                       # chromatic echo: R lags, B leads, by a share of the tap delay
+                dl = max(1, int(round(cs * 0.35 * d)))
+                r, b = fetch(k - dl, form), fetch(min(k + dl, n), form)
+                if img is None and r is None and b is None:
+                    continue
+                z = lambda a: a if a is not None else self._black
+                img = np.stack([z(r)[..., 0], z(img)[..., 1], z(b)[..., 2]], -1)
+            elif img is None:
                 continue
-            acc += m * self._shift(img, sh)
+            if self.p.accumulate == "max" and groups is self.g_wet_live:
+                np.maximum(acc, m * self._shift(img, sh), out=acc)     # light-painting: copies never stack
+            else:
+                acc += m * self._shift(img, sh)
         return acc
 
     # -- render ----------------------------------------------------------------------
@@ -256,6 +322,8 @@ class VideoEcho:
         if p.tail_s is not None:
             return int(p.tail_s * self.fps)
         tail = self.max_delay
+        if self.fb_taps and p.feedback >= 0.999:                 # runaway loop: ring out to the cap
+            return int(p.max_tail_s * self.fps)
         if self.fb_taps:
             mean_d = sum(t.delay * w for t, w in self.fb_taps)
             tail += mean_d * math.log(1e-3) / math.log(p.feedback)
@@ -270,6 +338,7 @@ class VideoEcho:
         clip. Runs until both clips end, then the tail; a clip that ends early continues as black."""
         if not hasattr(self, "g_wet"):
             self._build_groups()
+        self.g_wet_live = self.g_wet
         p, ring_n = self.p, self.max_delay + 2
         ring = {}
         phase = p.negative_mode == "phase"
@@ -292,6 +361,21 @@ class VideoEcho:
             return from_oklab(lab)
 
         black = np.zeros((self.H, self.W, 3), np.float32)
+        hot = p.punch > 0 or p.blend in ("add", "screen") or p.feedback >= 0.9
+        fb_xf = (0.0, 0.0, round(1.0 + p.fb_zoom, 4), p.fb_spin)
+        # stutter: per depth step, each tap group survives with a chance that favours strong taps
+        imp = {k: float(np.max(np.abs(v))) for k, v in self.g_wet.items()} if not phase else {}
+        top = max(imp.values(), default=1.0) or 1.0
+        block = max(1, int(round(self.step)))
+
+        def gated(n):
+            if p.stutter <= 0 or phase:
+                return self.g_wet
+            rng = np.random.default_rng([p.stutter_seed, n // block])
+            keep = {k: v for k, v in self.g_wet.items()
+                    if rng.random() < 1.0 - p.stutter * (1.0 - 0.6 * imp[k] / top)}
+            return keep or self.g_wet
+
         it, n, tail_left = iter(frames), 0, None
         eit = iter(echo_frames) if echo_frames is not None else None
         while True:
@@ -308,13 +392,36 @@ class VideoEcho:
             if self.g_fb:
                 bus = self._apply(self.g_fb, n, fetch)
                 bus = mix_lab(*bus) if phase else bus
-                u = u + p.feedback * bus
+                if fb_xf[2] != 1.0 or fb_xf[3]:                   # the tunnel: every pass zooms / turns again
+                    bus = self._shift(bus, fb_xf)
+                if p.fb_hue:
+                    bus = rotate_chroma(np.maximum(bus, 0), p.fb_hue)
+                u = (1 - min(p.feedback, 1.0)) * u + p.feedback * bus if p.fb_crossfade else u + p.feedback * bus
+                if p.feedback >= 0.9:                              # loop gain >= 1 is allowed; the clip keeps it bounded
+                    u = soft_clip(u)
             ring[n] = {"lin": u.astype(np.float32)}
             ring.pop(n - ring_n, None)
-            wet = self._apply(self.g_wet, n, fetch)
+            self.g_wet_live = gated(n)
+            wet = self._apply(self.g_wet_live, n, fetch)
             wet = mix_lab(*wet, gain=self.wet_gain) if phase else self.wet_gain * wet
-            yield (1 - p.mix) * x + p.mix * wet
+            if hot:
+                wet = soft_clip(wet)
+            yield self._blend(x, wet)
             n += 1
+
+    def _blend(self, x, w):
+        p, m = self.p, self.p.mix
+        if p.blend == "average":
+            return (1 - m) * x + m * w
+        if p.blend == "add":
+            b = soft_clip(x + np.maximum(w, 0))
+        elif p.blend == "screen":
+            b = 1 - (1 - np.clip(x, 0, 1)) * (1 - np.clip(w, 0, 1))
+        elif p.blend == "lighten":
+            b = np.maximum(x, w)
+        else:                                                     # difference
+            b = np.abs(x - w)
+        return (1 - m) * x + m * b
 
     # -- sidecars --------------------------------------------------------------------
     def tap_map(self):
@@ -325,6 +432,7 @@ class VideoEcho:
             "params": asdict(self.p), "warnings": self.warnings,
             "taps": [{"site": t.site, "depth": t.depth, "delay_frames": t.delay,
                       "delay_s": t.delay / self.fps, "level": t.level, "sign": t.sign,
-                      "arg": t.angle, "x": t.x, "y": t.y, "shift_px": list(t.shift_px)}
+                      "arg": t.angle, "x": t.x, "y": t.y, "shift_px": list(t.shift_px),
+                      "scale": t.scale, "rotate": t.rotate}
                      for t in self.taps],
         }

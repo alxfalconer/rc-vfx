@@ -83,9 +83,9 @@ aside.left{grid-area:left} .stage{grid-area:stage} aside.right{grid-area:right}
 /* ---- fader: slot track, cream cap ---- */
 input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:28px;background:transparent;cursor:pointer;display:block}
 /* the slot fills with the accent from min up to the cap: --p (0..1) is set from JS */
-input[type=range]{--fill:calc(7px + (100% - 14px) * var(--p, 0))}
+input[type=range]{--fill:calc(7px + (100% - 14px) * var(--p, 0));--fill0:calc(7px + (100% - 14px) * var(--p0, 0))}
 input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;
-  background:linear-gradient(90deg,var(--accent) 0,var(--accent-hi) var(--fill),#d1cfc7 var(--fill));
+  background:linear-gradient(90deg,#d1cfc7 var(--fill0),var(--accent) var(--fill0),var(--accent-hi) var(--fill),#d1cfc7 var(--fill));
   box-shadow:inset 0 1px 2px rgba(0,0,0,.38),0 1px 0 rgba(255,255,255,.95)}
 input[type=range]::-moz-range-progress{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent-hi))}
 input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:#d1cfc7;box-shadow:inset 0 1px 2px rgba(0,0,0,.38),0 1px 0 rgba(255,255,255,.95)}
@@ -163,17 +163,29 @@ details summary:focus-visible{outline:2px solid var(--ink);outline-offset:3px;bo
 .sub{margin-top:16px}
 
 /* ---- piano keys (negative mode) ---- */
-#modes{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;padding:4px;background:var(--frame);border-radius:8px;
+#modes, .keyrow{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;padding:4px;background:var(--frame);border-radius:8px;
   box-shadow:0 1px 0 rgba(255,255,255,.9),0 2px 5px rgba(0,0,0,.28)}
-#modes button{position:relative;height:60px;border:0;border-radius:5px;font:inherit;font-size:11px;color:var(--ink-2);cursor:pointer;
+#modes button, .keyrow button{position:relative;height:60px;border:0;border-radius:5px;font:inherit;font-size:11px;color:var(--ink-2);cursor:pointer;
   display:flex;align-items:flex-end;justify-content:center;padding-bottom:7px;transition:transform .06s,box-shadow .06s;
   background:radial-gradient(ellipse 80% 60% at 50% 40%,#e8e5db,#f5f3ec 60%,#fcfbf6);
   box-shadow:inset 0 3px 5px rgba(0,0,0,.1),inset 0 -2px 3px rgba(255,255,255,.95),0 2px 0 #cbc7bb,0 3px 2px rgba(0,0,0,.4)}
-#modes button[aria-pressed="true"]{transform:translateY(2px);color:var(--ink);
+#modes button[aria-pressed="true"], .keyrow button[aria-pressed="true"]{transform:translateY(2px);color:var(--ink);
   box-shadow:inset 0 3px 6px rgba(0,0,0,.17),inset 0 -2px 3px rgba(255,255,255,.85),0 0 0 #cbc7bb,0 1px 1px rgba(0,0,0,.4)}
-#modes button[aria-pressed="true"]::before{content:"";position:absolute;top:15px;left:50%;width:11px;height:11px;margin-left:-5.5px;border-radius:50%;
+#modes button[aria-pressed="true"]::before, .keyrow button[aria-pressed="true"]::before{content:"";position:absolute;top:15px;left:50%;width:11px;height:11px;margin-left:-5.5px;border-radius:50%;
   background:radial-gradient(circle at 40% 35%,var(--accent-hi),var(--accent) 60%,var(--accent-lo));box-shadow:0 1px 1px rgba(0,0,0,.25)}
-#modes button:focus-visible{outline:2px solid var(--ink);outline-offset:-6px}
+#modes button:focus-visible, .keyrow button:focus-visible{outline:2px solid var(--ink);outline-offset:-6px}
+.keyrow{grid-template-columns:repeat(3,1fr)}
+.keyrow.five{grid-template-columns:repeat(5,1fr)}
+.keyrow.five button{height:44px;font-size:10.5px;padding-bottom:6px}
+.keyrow.five button[aria-pressed="true"]::before{top:9px;width:8px;height:8px;margin-left:-4px}
+.keyrow.presets button{height:52px}
+.keyrow.presets button[aria-pressed="true"]::before{top:12px}
+.seg{display:flex;gap:6px}
+.seg .te-key{flex:1;justify-content:center}
+.char-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 32px}
+.char-grid > div > h3:first-child{margin-top:0}
+@media (max-width:1100px){ .char-grid{grid-template-columns:1fr} }
+.housing h3 .legend{font-weight:400;font-size:11px;color:var(--ink-3);float:right}
 
 /* ---- render: round push button ---- */
 .go-row{display:flex;align-items:center;gap:22px;margin-top:22px}
@@ -389,6 +401,38 @@ td.fail{color:var(--red)}
     <div id="bar" role="presentation"></div>
   </section>
 
+  <section class="housing" id="character">
+    <h2>Character <em>mapping</em></h2>
+    <div class="char-grid">
+      <div>
+    <div class="keyrow presets" id="presets" role="group" aria-label="preset"></div>
+    <p class="note" id="presetHint"></p>
+    <h3>Blend <span class="legend">how echoes meet the clip</span></h3>
+    <div class="keyrow five" id="blends" role="group" aria-label="blend">
+      <button data-b="average" aria-pressed="true">average</button><button data-b="add">add</button><button data-b="screen">screen</button><button data-b="lighten">lighten</button><button data-b="difference">diff</button>
+    </div>
+    <div class="row" style="margin-top:12px"><label>stack</label>
+      <div class="seg" id="accum"><button class="te-key sm" data-v="sum" aria-pressed="true">sum</button><button class="te-key sm" data-v="max" aria-pressed="false">max</button></div><span></span></div>
+    <div class="row"><label for="bpm">tempo</label><select id="bpm" class="field"><option value="">free</option><option>90</option><option>120</option><option>140</option><option>174</option></select><span></span></div>
+      </div>
+      <div>
+    <div class="row"><label for="punch">punch</label><input type="range" id="punch" min="0" max="1" step="0.05" value="0"><output for="punch"></output></div>
+    <div class="row"><label for="sparsity">taps kept</label><input type="range" id="sparsity" min="0" max="40" step="1" value="0"><output for="sparsity"></output></div>
+    <div class="row"><label for="zoom">zoom</label><input type="range" id="zoom" min="-1" max="1" step="0.05" value="0"><output for="zoom"></output></div>
+    <div class="row"><label for="spin">spin</label><input type="range" id="spin" min="-1" max="1" step="0.05" value="0"><output for="spin"></output></div>
+    <div class="row"><label for="chroma_split">chroma split</label><input type="range" id="chroma_split" min="0" max="1" step="0.05" value="0"><output for="chroma_split"></output></div>
+    <div class="row"><label for="stutter">stutter</label><input type="range" id="stutter" min="0" max="1" step="0.05" value="0"><output for="stutter"></output></div>
+    <h3>Loop <span class="legend">feedback bus, per pass</span></h3>
+    <div class="row"><label>mode</label>
+      <div class="seg" id="fbx"><button class="te-key sm" data-v="0" aria-pressed="true">add</button><button class="te-key sm" data-v="1" aria-pressed="false">crossfade</button></div><span></span></div>
+    <div class="row"><label for="fb_zoom">loop zoom</label><input type="range" id="fb_zoom" min="-0.2" max="0.2" step="0.01" value="0"><output for="fb_zoom"></output></div>
+    <div class="row"><label for="fb_spin">loop spin</label><input type="range" id="fb_spin" min="-15" max="15" step="0.5" value="0"><output for="fb_spin"></output></div>
+    <div class="row"><label for="fb_hue">loop hue</label><input type="range" id="fb_hue" min="0" max="1.5" step="0.05" value="0"><output for="fb_hue"></output></div>
+      </div>
+    </div>
+  </section>
+
+
   <section class="housing outputs">
     <h2>Outputs</h2>
     <div class="files" id="files"><p>appears after a render</p></div>
@@ -417,7 +461,7 @@ td.fail{color:var(--red)}
       <output for="master_s"></output></div>
     <div class="row"><label for="spatial_width">spatial width</label><input type="range" id="spatial_width" min="0" max="1" step="0.01" value="1"><output for="spatial_width"></output></div>
     <div class="row"><label for="drift">drift</label><input type="range" id="drift" min="-0.6" max="0.6" step="0.01" value="0"><output for="drift"></output></div>
-    <div class="row"><label for="feedback">feedback</label><input type="range" id="feedback" min="0" max="0.9" step="0.01" value="0"><output for="feedback"></output></div>
+    <div class="row"><label for="feedback">feedback</label><input type="range" id="feedback" min="0" max="1.2" step="0.01" value="0"><output for="feedback"></output></div>
     <div class="row"><label for="grain_frames">grain (frames)</label><input type="range" id="grain_frames" min="2" max="30" step="1" value="6"><output for="grain_frames"></output></div>
     <div class="row"><label for="max_height">max height</label><select id="max_height" class="field"><option>270</option><option selected>480</option><option>720</option></select><span></span></div>
     <div class="go-row">
@@ -474,8 +518,9 @@ let mode = "invert", polling = null;
 
 document.querySelectorAll(".row input[type=range]").forEach(r => {
   const o = r.closest(".row").querySelector("output");
-  const show = () => { o.textContent = r.value;
-    r.style.setProperty("--p", (r.value - r.min) / ((r.max - r.min) || 1)); };
+  const show = () => { o.textContent = r.id === "sparsity" && +r.value === 0 ? "all" : r.value;
+    const span = (r.max - r.min) || 1, t = (r.value - r.min) / span, z = r.min < 0 ? -r.min / span : 0;  // two-way: fill from 0
+    r.style.setProperty("--p0", Math.min(t, z)); r.style.setProperty("--p", Math.max(t, z)); };
   r.addEventListener("input", show); show();
 });
 function setMode(m){ mode = m;
@@ -560,6 +605,52 @@ viewer.addEventListener("drop", e => { e.preventDefault(); const side = dropSide
 window.addEventListener("dragover", e => { if (hasFiles(e)) e.preventDefault(); });
 window.addEventListener("drop", e => { if (hasFiles(e)) e.preventDefault(); });
 
+/* character: presets set many controls at once; touching any of them afterwards = custom */
+let blend = "average", accumulate = "sum", fb_crossfade = false, hidden = {}, PRESETS = {}, preset = null, applying = false;
+const PRESET_HINTS = {
+  faithful: "the measured tap map, drawn literally: echoes averaged, as the physics says.",
+  trails: "a few strong taps, each echo at full strength: light-painting copies.",
+  tunnel: "the feedback loop zooms and turns every pass: an infinite tunnel out of the butterfly site.",
+  shatter: "difference blend, negative taps, chromatic split, spin: the frame fractures.",
+  strobe: "taps lock to 120 bpm and stutter on the beat: negative flashes.",
+  meltdown: "everything on: loop zoom and hue drift, spin, chroma split, stutter.",
+};
+function pressGroup(sel, attr, v){ document.querySelectorAll(`${sel} button`).forEach(b => b.setAttribute("aria-pressed", String(b.dataset[attr] === String(v)))); }
+function setBlend(v){ blend = v; pressGroup("#blends", "b", v); }
+function setAccum(v){ accumulate = v; pressGroup("#accum", "v", v); }
+function setFbx(v){ fb_crossfade = !!v; pressGroup("#fbx", "v", v ? "1" : "0"); }
+function markPreset(name){
+  preset = name; pressGroup("#presets", "p", name || "");
+  $("presetHint").textContent = name ? PRESET_HINTS[name] || "" : "custom: your own mix of settings.";
+}
+function applyPreset(name){
+  const ps = PRESETS[name]; if (!ps) return;
+  applying = true; hidden = {};
+  for (const [k, v] of Object.entries(ps)) {
+    const el = $(k);
+    if (k === "negative_mode") setMode(v);
+    else if (k === "blend") setBlend(v);
+    else if (k === "accumulate") setAccum(v);
+    else if (k === "fb_crossfade") setFbx(v);
+    else if (k === "bpm") $("bpm").value = v ? String(Math.round(v)) : "";
+    else if (el && el.type === "range") { el.value = v; el.dispatchEvent(new Event("input")); }
+    else if (k !== "division" || v !== 0.25) hidden[k] = v;   // feedback_source, max_tail_s, division: no control
+  }
+  applying = false; markPreset(name); estimate();
+}
+async function loadPresets(){
+  try { PRESETS = await (await api("/presets")).json(); } catch (e) { PRESETS = {}; }
+  $("presets").innerHTML = Object.keys(PRESETS).map(n => `<button data-p="${n}">${n}</button>`).join("");
+  document.querySelectorAll("#presets button").forEach(b => b.onclick = () => applyPreset(b.dataset.p));
+  if (PRESETS.trails) applyPreset("trails"); else markPreset(null);
+}
+document.querySelectorAll("#blends button").forEach(b => b.onclick = () => { setBlend(b.dataset.b); markPreset(null); estimate(); });
+document.querySelectorAll("#accum button").forEach(b => b.onclick = () => { setAccum(b.dataset.v); markPreset(null); estimate(); });
+document.querySelectorAll("#fbx button").forEach(b => b.onclick = () => { setFbx(b.dataset.v === "1"); markPreset(null); estimate(); });
+document.querySelectorAll("aside.right input, aside.right select, #character input, #character select").forEach(el =>
+  el.addEventListener("input", () => { if (!applying && preset) markPreset(null); }));
+document.querySelectorAll("#modes button").forEach(b => b.addEventListener("click", () => { if (!applying && preset) markPreset(null); }));
+
 function params(){
   const pi = Math.PI, num = id => parseFloat($(id).value), p = {
     lattice: $("lattice").value, depth: +$("depth").value,
@@ -567,7 +658,11 @@ function params(){
     kick: $("kick").value, disorder: num("disorder"), seed: +$("seed").value || 0,
     negative_mode: mode, mix: num("mix"), decay: num("decay"), master_s: num("master_s"),
     spatial_width: num("spatial_width"), drift: num("drift"), feedback: num("feedback"),
-    grain_frames: +$("grain_frames").value, max_height: +$("max_height").value };
+    grain_frames: +$("grain_frames").value, max_height: +$("max_height").value,
+    blend, accumulate, punch: num("punch"), sparsity: +$("sparsity").value, zoom: num("zoom"), spin: num("spin"),
+    chroma_split: num("chroma_split"), stutter: num("stutter"), fb_zoom: num("fb_zoom"), fb_spin: num("fb_spin"),
+    fb_hue: num("fb_hue"), fb_crossfade, ...hidden };
+  if ($("bpm").value) { p.bpm = +$("bpm").value; p.division = hidden.division ?? 0.25; } else { delete p.bpm; }
   if (p.lattice === "square") p.shape = $("shape").value.split(",").map(Number); else p.n_sites = +$("n_sites").value;
   if ($("kick_site").value !== "") p.kick_site = +$("kick_site").value;
   return p;
@@ -581,7 +676,7 @@ function estimate(){ clearTimeout(estT); estT = setTimeout(async () => {
     ? `${j.taps} live taps · ~${j.output_seconds.toFixed(1)} s out for a 6 s clip${j.warnings.length ? " · " + j.warnings[0] : ""}`
     : (j.error ? j.error.message : "invalid");
 }, 250); }
-document.querySelectorAll("aside input, aside select").forEach(e => e.addEventListener("change", estimate));
+document.querySelectorAll("aside input, aside select, #character input, #character select").forEach(e => e.addEventListener("change", estimate));
 estimate();
 
 /* readout */
@@ -632,7 +727,7 @@ function loaderFrame(now){
     lx.beginPath(); lx.arc(xk, yk, 2.2, 0, 2*Math.PI); lx.fill();
   }
   lx.font = "11px Inter, Helvetica, Arial, sans-serif"; lx.fillStyle = "rgba(255,255,255,.4)";
-  lx.fillText(`delay line · ${N} taps · decay ${decay.toFixed(2)} · ${mode}${echoFile ? " · cross-echo: taps read B" : ""}`, 16, 24);
+  lx.fillText(`delay line · ${N} taps · decay ${decay.toFixed(2)} · ${mode} · ${preset || "custom"}${echoFile ? " · cross-echo: taps read B" : ""}`, 16, 24);
   if (!still.matches) ldRaf = requestAnimationFrame(loaderFrame);
 }
 function loader(on){ cancelAnimationFrame(ldRaf); LD.hidden = !on;
@@ -640,7 +735,9 @@ function loader(on){ cancelAnimationFrame(ldRaf); LD.hidden = !on;
 
 /* serverless: clips go browser → Vercel Blob, then one /render call does measure + render + store */
 let blobUpload = null;
+const MAX_UPLOAD = 200 * 1048576;
 async function toBlob(file, label){
+  if (file.size > MAX_UPLOAD) throw new Error(`clip ${label} is ${(file.size / 1048576).toFixed(0)} MB; the limit is 200 MB`);
   blobUpload = blobUpload || (await import("https://esm.sh/@vercel/blob@2.8.0/client")).upload;
   const name = "clips/" + file.name.replace(/[^\w.\- ]+/g, "_").slice(-100);
   const b = await blobUpload(name, file, {
@@ -745,6 +842,7 @@ async function refreshJobs(){
   $("irref").innerHTML = js.filter(j => j.status === "succeeded" && ref(j)).map(j => `<option value="${ref(j)}">job:${j.id.slice(0, 12)}/ir</option>`).join("") || "<option value=''>no finished jobs yet</option>";
 }
 refreshJobs();
+loadPresets();
 
 /* moth: bring your own key. the key goes to this server once and is never read back. */
 const dlg = $("mothDlg");

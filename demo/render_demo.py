@@ -3,6 +3,7 @@ sys.path.insert(0, "src")
 import sim
 from echo_ir import EchoIR
 from render import VideoEcho, RenderParams, lin_to_srgb
+from params import PRESETS, Params
 from videoio import read_frames, Writer
 out = pathlib.Path("demo/out"); out.mkdir(exist_ok=True)
 
@@ -21,7 +22,12 @@ variants = {
     "phase":    (ir_cplx, RenderParams(negative_mode="phase", mix=0.6, decay=0.9)),
     "tunnel":   (ir_real, RenderParams(negative_mode="invert", mix=0.55, drift=0.35, feedback=0.6)),
 }
+# `python demo/render_demo.py presets` renders every UI preset (params.PRESETS) as preset-<name>.mp4
+for pname, ps in PRESETS.items():
+    variants[f"preset-{pname}"] = (ir_real, RenderParams(**Params(**ps).render_kwargs()))
 only = sys.argv[1:]
+if only == ["presets"]:
+    only = [k for k in variants if k.startswith("preset-")]
 for name, (ir, p) in variants.items():
     if only and name not in only: continue
     info, frames = read_frames("demo/source.mp4")

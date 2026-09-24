@@ -97,3 +97,30 @@ def test_fps_cap_resamples(tmp_path):
                     "-pix_fmt", "yuv420p", str(src)], check=True)
     info, frames = videoio.read_frames(str(src), max_fps=30)
     assert info["fps"] == 30.0 and 28 <= sum(1 for _ in frames) <= 32
+
+
+def test_inputs_are_deleted_after_render(blob, monkeypatch):
+    gone = []
+    monkeypatch.setattr(serve, "_blob_delete", lambda urls: gone.extend(urls) or len(urls))
+    a, b = BLOB + "clips/a.mp4", BLOB + "clips/b.mp4"
+    render({"params": FAST, "video_url": a, "echo_url": b})
+    assert sorted(gone) == [a, b]
+    gone.clear()
+    render({"params": {**FAST, "min_level": 1.0}, "video_url": a})      # failed renders clean up too
+    assert gone == [a]
+
+
+def test_cleanup_is_cron_only_and_drops_old_blobs(monkeypatch):
+    import datetime as dt, types
+    now = dt.datetime.now(dt.timezone.utc)
+    items = {"renders/": [types.SimpleNamespace(url=BLOB + "renders/old", uploaded_at=now - dt.timedelta(days=9)),
+                          types.SimpleNamespace(url=BLOB + "renders/new", uploaded_at=now - dt.timedelta(days=1))],
+             "clips/": [types.SimpleNamespace(url=BLOB + "clips/orphan", uploaded_at=now - dt.timedelta(hours=3))]}
+    gone = []
+    monkeypatch.setattr(serve, "_blob_list", lambda prefix: items[prefix])
+    monkeypatch.setattr(serve, "_blob_delete", lambda urls: gone.extend(urls) or len(urls))
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+    assert C.get("/cleanup").status_code == 401
+    assert C.get("/cleanup", headers={"Authorization": "Bearer nope"}).status_code == 401
+    r = C.get("/cleanup", headers={"Authorization": "Bearer s3cret"})
+    assert r.json() == {"deleted": {"renders": 1, "clips": 1}} and sorted(gone) == [BLOB + "clips/orphan", BLOB + "renders/old"]

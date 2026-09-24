@@ -21,7 +21,7 @@ import moth
 import sim
 from diagnostics import impulse_spacetime_png
 from echo_ir import EchoIR
-from params import ERROR_CODES, MAX_INPUT_S, MAX_UPLOAD_MB, Params
+from params import ERROR_CODES, MAX_INPUT_S, MAX_UPLOAD_MB, PRESETS, Params
 from render import RenderParams, VideoEcho
 from videoio import Writer, probe, read_frames
 
@@ -118,6 +118,12 @@ def engine():
         "params_schema": Params.model_json_schema(),
         "error_codes": [{"code": k, "message": v} for k, v in ERROR_CODES.items()],
     }
+
+
+@app.get("/presets")
+def presets():
+    """Render characters for the UI preset bank; each validates as Params on its own."""
+    return PRESETS
 
 
 @app.post("/validate")
@@ -343,6 +349,45 @@ def _blob_put(path: str, data: bytes, content_type: str) -> str:
 RENDER_BUDGET_S = float(os.environ.get("RCV_RENDER_BUDGET_S", 270 if os.environ.get("VERCEL") else 0))
 
 
+def _blob_delete(urls) -> int:
+    urls = [u for u in urls if u]
+    if not urls:
+        return 0
+    from vercel.blob import delete                     # Vercel runtime only
+    delete(urls)
+    return len(urls)
+
+
+def _blob_list(prefix: str):
+    from vercel.blob import iter_objects               # Vercel runtime only
+    return iter_objects(prefix=prefix)
+
+
+def _drop_inputs(*urls):
+    """Uploaded clips are inputs only: remove them once a render is over (Hobby Blob is 1 GB)."""
+    try:
+        _blob_delete([u for u in urls if u and BLOB_URL.match(u) and "/clips/" in u])
+    except Exception:
+        traceback.print_exc()
+
+
+@app.get("/cleanup")
+def cleanup(authorization: str | None = Header(None)):
+    """Vercel Cron (daily): drop renders older than RCV_RENDER_TTL_DAYS and orphaned uploads."""
+    secret = os.environ.get("CRON_SECRET")
+    if not secret or authorization != f"Bearer {secret}":
+        raise HTTPException(401, "cron only")
+    now = time.time()
+    ttl = {"renders/": float(os.environ.get("RCV_RENDER_TTL_DAYS", 7)) * 86400, "clips/": 3600.0}
+    gone = {}
+    for prefix, age in ttl.items():
+        old = [b.url for b in _blob_list(prefix) if now - b.uploaded_at.timestamp() > age]
+        for i in range(0, len(old), 500):
+            _blob_delete(old[i:i + 500])
+        gone[prefix.rstrip("/")] = len(old)
+    return {"deleted": gone}
+
+
 @app.post("/render")
 def render_now(req: RenderRequest, x_moth_key: str | None = Header(None)):
     """Validate, then stream NDJSON: progress lines while it works, then {"job": ...} or {"error": ...}."""
@@ -365,6 +410,8 @@ def render_now(req: RenderRequest, x_moth_key: str | None = Header(None)):
         except Exception as e:
             traceback.print_exc()
             box["error"] = {"code": "render_failed", "message": f"{type(e).__name__}: {e}"}
+        finally:
+            _drop_inputs(req.video_url, req.echo_url)
 
     def stream():
         t = threading.Thread(target=work, daemon=True); t.start()

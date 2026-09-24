@@ -40,12 +40,27 @@ class Params(BaseModel):
     spatial_width: float = Field(1.0, ge=0, le=1)
     drift: float = Field(0.0, ge=-1, le=1)
     grain_frames: int = Field(6, ge=2, le=60)
-    feedback: float = Field(0.0, ge=0, lt=1)
+    feedback: float = Field(0.0, ge=0, lt=1.25, description=">= 1 runs away; soft-clipped")
     feedback_source: Literal["kick", "all"] = "kick"
     min_level: float = Field(0.02, ge=0, le=1)
     tail_s: Optional[float] = Field(None, ge=0, le=20)
     max_tail_s: float = Field(10.0, ge=0, le=20)
     max_height: int = Field(480, ge=64, le=MAX_HEIGHT)
+
+    # --- expressive layer (defaults = the faithful renderer) ---
+    blend: Literal["average", "add", "screen", "lighten", "difference"] = "average"
+    punch: float = Field(0.0, ge=0, le=1, description="0 = averaged echoes, 1 = each echo at full strength")
+    sparsity: int = Field(0, ge=0, le=400, description="keep only the K strongest taps (0 = all)")
+    zoom: float = Field(0.0, ge=-1, le=1, description="deeper taps scale by 1 + zoom * t/T about the kick site")
+    spin: float = Field(0.0, ge=-1, le=1, description="deeper taps rotate by spin * 30deg * t/T, direction = sign F")
+    fb_zoom: float = Field(0.0, ge=-0.25, le=0.25, description="feedback bus scale per pass")
+    fb_spin: float = Field(0.0, ge=-20, le=20, description="feedback bus degrees per pass")
+    fb_hue: float = Field(0.0, ge=0, le=1.5, description="feedback bus chroma rotation per pass (radians)")
+    chroma_split: float = Field(0.0, ge=0, le=1, description="R lags / B leads by a share of each tap's delay")
+    stutter: float = Field(0.0, ge=0, le=1, description="chance a tap group drops out per depth step")
+    stutter_seed: int = Field(0, ge=0)
+    fb_crossfade: bool = Field(False, description="feedback crossfades input with the bus (tunnels) instead of adding")
+    accumulate: Literal["sum", "max"] = Field("sum", description="max = each echo copy at full strength, no stacking")
 
     model_config = {"extra": "forbid"}
 
@@ -70,7 +85,8 @@ class Params(BaseModel):
 
     def render_kwargs(self):
         keys = ("negative_mode master_s bpm division decay mix spatial_width drift grain_frames "
-                "feedback feedback_source min_level tail_s max_tail_s").split()
+                "feedback feedback_source min_level tail_s max_tail_s blend punch sparsity zoom spin "
+                "fb_zoom fb_spin fb_hue chroma_split stutter stutter_seed fb_crossfade accumulate").split()
         return {k: getattr(self, k) for k in keys}
 
 
@@ -84,4 +100,32 @@ ERROR_CODES = {
     "moth_unavailable": "The Moth API could not be reached, or is rate limiting.",
     "moth_failed": "The Moth measurement job failed or returned no readable trajectory.",
     "timeout": "Serverless only: the render would not finish inside the function time limit."
+}
+
+
+# ---------------------------------------------------------------- presets
+# Render-side "characters". Physics fields are left alone, so a preset reshapes how the same
+# measured tap map is drawn. `faithful` is the renderer's own defaults.
+_OFF = dict(blend="average", punch=0.0, sparsity=0, zoom=0.0, spin=0.0, fb_zoom=0.0, fb_spin=0.0, fb_hue=0.0,
+            chroma_split=0.0, stutter=0.0, bpm=None, division=0.25, drift=0.0, feedback=0.0,
+            feedback_source="kick", max_tail_s=10.0, fb_crossfade=False, accumulate="sum")
+PRESETS = {
+    "faithful": {**_OFF, "negative_mode": "invert", "mix": 0.5, "decay": 0.82, "master_s": 2.0,
+                 "spatial_width": 1.0, "grain_frames": 6},
+    "trails":   {**_OFF, "negative_mode": "invert", "accumulate": "max", "sparsity": 6, "mix": 0.8,
+                 "decay": 0.97, "master_s": 3.0, "spatial_width": 0.0, "grain_frames": 6},
+    "tunnel":   {**_OFF, "negative_mode": "reverse", "blend": "screen", "accumulate": "max", "sparsity": 8,
+                 "mix": 0.9, "decay": 0.9, "master_s": 1.5, "spatial_width": 0.0, "grain_frames": 6, "zoom": 0.6,
+                 "feedback": 0.85, "feedback_source": "all", "fb_zoom": 0.08, "fb_spin": 4.0, "fb_crossfade": True,
+                 "max_tail_s": 3.0},
+    "shatter":  {**_OFF, "negative_mode": "negative", "blend": "difference", "punch": 0.8, "sparsity": 8,
+                 "mix": 1.0, "decay": 0.9, "master_s": 1.2, "spatial_width": 1.0, "grain_frames": 6,
+                 "spin": 0.6, "chroma_split": 0.5, "feedback": 0.5, "fb_crossfade": True, "max_tail_s": 3.0},
+    "strobe":   {**_OFF, "negative_mode": "negative", "accumulate": "max", "sparsity": 6, "mix": 0.9,
+                 "decay": 1.0, "master_s": 2.0, "spatial_width": 0.0, "grain_frames": 6, "bpm": 120.0,
+                 "division": 0.25, "stutter": 0.7},
+    "meltdown": {**_OFF, "negative_mode": "reverse", "blend": "screen", "accumulate": "max", "sparsity": 10,
+                 "mix": 1.0, "decay": 0.95, "master_s": 1.5, "spatial_width": 0.0, "grain_frames": 8, "zoom": 0.6,
+                 "spin": 0.8, "feedback": 0.85, "feedback_source": "all", "fb_zoom": 0.05, "fb_spin": 4.0,
+                 "fb_hue": 0.5, "chroma_split": 0.7, "stutter": 0.4, "fb_crossfade": True, "max_tail_s": 3.0},
 }

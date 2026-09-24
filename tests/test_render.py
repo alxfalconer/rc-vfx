@@ -154,3 +154,73 @@ def test_cross_echo_runs_to_the_longer_clip_then_tail():
 
 def run_x(ve, frames, echo):
     return list(ve.process(iter(frames), iter(echo)))
+
+
+# ---- expressive layer (all default-off; the faithful path is covered above) ------------
+def flash_run(p, ir=None, n=40, value=0.5):
+    ve = VideoEcho(ir or const_ir(0.5), FPS, (H, W), p)
+    flash = [np.full((H, W, 3), value, np.float32)] + [np.zeros((H, W, 3), np.float32)] * n
+    return ve, run(ve, flash)
+
+def test_lighten_never_darkens_dry():
+    rng = np.random.default_rng(1)
+    frames = [rng.random((H, W, 3)).astype(np.float32) for _ in range(20)]
+    ve = VideoEcho(const_ir(-0.5), FPS, (H, W), RenderParams(master_s=0.2, mix=1.0, blend="lighten"))
+    out = run(ve, frames)
+    assert all((o >= f - 1e-6).all() for o, f in zip(out, frames))
+
+def test_difference_of_static_transparent_map_is_black():
+    frame = np.random.default_rng(0).random((H, W, 3)).astype(np.float32)
+    ve = VideoEcho(const_ir(0.6), FPS, (H, W), RenderParams(master_s=0.1, mix=1.0, blend="difference"))
+    assert np.abs(run(ve, [frame] * 12)[10]).max() < 3e-3
+
+def test_punch_brings_echoes_to_full_strength():
+    peak = lambda punch: max(f.max() for f in flash_run(RenderParams(master_s=0.3, mix=1.0, punch=punch))[1][1:])
+    assert peak(1.0) >= 0.8 * 0.5 and peak(1.0) > 1.6 * peak(0.0)
+
+def test_sparsity_keeps_the_k_strongest_taps():
+    ir = sim.measure_ir(8, 6, kick_site=3)
+    full = VideoEcho(ir, FPS, (H, W), RenderParams())
+    sparse = VideoEcho(ir, FPS, (H, W), RenderParams(sparsity=5))
+    assert len(sparse.taps) == 5
+    assert min(t.level for t in sparse.taps) >= sorted((t.level for t in full.taps), reverse=True)[4] - 1e-12
+
+def test_zoom_pushes_echoes_away_from_the_kick_site():
+    ve = VideoEcho(const_ir(0.5), FPS, (H, W), RenderParams(master_s=0.3, mix=1.0, spatial_width=0, zoom=1.0))
+    dot = np.zeros((H, W, 3), np.float32); dot[H // 2 - 1:H // 2 + 1, 14:16] = 1.0     # right of the pivot, stays in frame at 2x
+    out = run(ve, [dot] + [np.zeros((H, W, 3), np.float32)] * 20)
+    cx = lambda img: (img[..., 1].sum(0) * np.arange(W)).sum() / max(img[..., 1].sum(), 1e-9)
+    deepest = max(ve.taps, key=lambda t: t.depth)
+    assert cx(out[deepest.delay]) - ve.pivot[0] > cx(dot) - ve.pivot[0] + 1
+
+def test_stutter_is_seeded_and_off_by_default():
+    rng = np.random.default_rng(2)
+    frames = [rng.random((H, W, 3)).astype(np.float32) for _ in range(30)]
+    ir = sim.measure_ir(8, 6, kick_site=3)
+    go = lambda **k: run(VideoEcho(ir, FPS, (H, W), RenderParams(master_s=0.5, mix=1.0, **k)), frames)
+    a, b, c, base = go(stutter=0.8, stutter_seed=7), go(stutter=0.8, stutter_seed=7), go(stutter=0.8, stutter_seed=8), go()
+    assert all(np.array_equal(x, y) for x, y in zip(a, b))
+    assert any(not np.allclose(x, y) for x, y in zip(a, c)) and any(not np.allclose(x, y) for x, y in zip(a, base))
+
+def test_runaway_feedback_stays_bounded():
+    ve = VideoEcho(const_ir(0.5), FPS, (H, W), RenderParams(master_s=0.2, mix=1.0, feedback=1.2, feedback_source="all",
+                                                            fb_zoom=0.05, fb_spin=5, fb_hue=0.4, max_tail_s=1))
+    out = run(ve, [np.full((H, W, 3), 0.8, np.float32)] * 60)
+    assert all(np.isfinite(f).all() and f.max() <= 1.0 + 1e-6 for f in out)
+    assert len(out) == 60 + int(1 * FPS)                  # loop gain >= 1 rings out to the tail cap
+
+def test_chroma_split_makes_red_lag_and_blue_lead():
+    ve, out = flash_run(RenderParams(master_s=0.6, mix=1.0, chroma_split=1.0, spatial_width=0))
+    t = lambda ch: max(range(1, len(out)), key=lambda n: out[n][..., ch].sum())
+    first_lit = lambda ch: min(n for n in range(1, len(out)) if out[n][..., ch].max() > 1e-4)
+    assert first_lit(0) > first_lit(1) > first_lit(2)
+
+def test_max_accumulation_never_stacks_copies():
+    # two equal copies of a flash land on the same pixels: max keeps one copy's brightness, sum would add
+    ir = const_ir(0.5)
+    rng = np.random.default_rng(3)
+    frames = [rng.random((H, W, 3)).astype(np.float32) * 0.5 for _ in range(20)]
+    ve = VideoEcho(ir, FPS, (H, W), RenderParams(master_s=0.2, mix=1.0, spatial_width=0, accumulate="max"))
+    out = run(ve, frames)
+    assert max(float(o.max()) for o in out) <= 0.5 + 1e-5          # never brighter than the brightest source
+    assert out[12].mean() > 0.2                                     # but each copy at (near) full strength
