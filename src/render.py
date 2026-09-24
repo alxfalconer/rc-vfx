@@ -24,6 +24,7 @@ import math
 import numpy as np
 import cv2
 from echo_ir import EchoIR
+from qblur import blur_frame
 
 MODES = ("invert", "negative", "reverse", "phase")
 BLENDS = ("average", "add", "screen", "lighten", "difference")
@@ -107,10 +108,23 @@ class RenderParams:
     stutter_seed: int = 0
     fb_crossfade: bool = False       # feedback as (1-f)*input + f*bus (video-synth style) instead of input + f*bus
     accumulate: str = "sum"          # "sum" (faithful) | "max": each echo copy at full strength, per-pixel max
+    # --- QuantumBlur (moth-quantum/QuantumBlur, as blur-v1) on the echoes, never the dry clip ---
+    qblur: float = 0.0               # strength: rotation per qubit as a fraction of pi
+    qblur_on: str = "echoes"         # "echoes": the echo layer | "depth": deeper taps blurrier | "loop": every feedback pass
+    qblur_reach: float = 0.0         # 0 local .. 1 non-local (blur-v1 `reach`; locality = 1 - reach)
+    qblur_style: str = "rx"          # rx | ry
+    qblur_mode: str = "blur"         # blur | ghost (rotation by displacement scale: distinct quantum copies)
+    qblur_scale: float = 0.5         # ghost: 0 = 1-cell jumps .. 1 = half-grid jumps
+    qblur_width: float = 0.3         # ghost: how many scales rotate (narrow = few copies)
+    qblur_size: int = 128            # grid cells on the long side (blur-v1 `size`); frames are resampled to it
+    qblur_shots: int = 0             # 0 = exact |amp|^2; else sampled measurements (grain)
 
     def validate(self):
         if self.negative_mode not in MODES:
             raise ValueError(f"negative_mode must be one of {MODES}")
+        if self.qblur_on not in ("echoes", "depth", "loop") or self.qblur_mode not in ("blur", "ghost") \
+                or self.qblur_style not in ("rx", "ry"):
+            raise ValueError("qblur_on must be echoes|depth|loop, qblur_mode blur|ghost, qblur_style rx|ry")
         if self.accumulate not in ("sum", "max"):
             raise ValueError("accumulate must be sum or max")
         if self.blend not in BLENDS:
@@ -230,7 +244,8 @@ class VideoEcho:
             self.warnings.append("feedback_source has no live taps; feedback disabled.")
         s = sum(t.level for t in src) or 1.0
         self.fb_taps = [(t, t.level / s) for t in src] if p.feedback > 0 else []
-        self.max_delay = max(t.delay for t in self.taps) + p.grain_frames
+        self.max_tap_delay = max(t.delay for t in self.taps)
+        self.max_delay = self.max_tap_delay + p.grain_frames
         if p.chroma_split > 0:                                   # the red channel reaches further back
             self.max_delay += int(round(p.chroma_split * 0.35 * self.max_delay)) + 1
 
@@ -297,10 +312,18 @@ class VideoEcho:
             return L, Z
         acc = np.zeros((self.H, self.W, 3), np.float32)
         cs = self.p.chroma_split
+        depth_blur = self.p.qblur > 0 and self.p.qblur_on == "depth" and groups is self.g_wet_live
+        blurred = {}
         for (d, kind, sh), m in groups.items():
             k = self._src_index(n, d, kind)
             form = "negimg" if (kind == "neg" and self.p.negative_mode == "negative") else "lin"
             img = fetch(k, form)
+            if depth_blur and img is not None:        # older echoes dissolve further
+                xi = self.p.qblur * d / self.max_tap_delay
+                key = (k, form, round(xi, 4))
+                if key not in blurred:
+                    blurred[key] = self._qblur(img, n, xi, salt=d)
+                img = blurred[key]
             if cs > 0:                       # chromatic echo: R lags, B leads, by a share of the tap delay
                 dl = max(1, int(round(cs * 0.35 * d)))
                 r, b = fetch(k - dl, form), fetch(min(k + dl, n), form)
@@ -396,6 +419,8 @@ class VideoEcho:
                     bus = self._shift(bus, fb_xf)
                 if p.fb_hue:
                     bus = rotate_chroma(np.maximum(bus, 0), p.fb_hue)
+                if p.qblur > 0 and p.qblur_on == "loop":          # each echo of an echo is blurred again
+                    bus = self._qblur(bus, n, p.qblur, salt=1_000_003)   # own stream, never a tap's
                 u = (1 - min(p.feedback, 1.0)) * u + p.feedback * bus if p.fb_crossfade else u + p.feedback * bus
                 if p.feedback >= 0.9:                              # loop gain >= 1 is allowed; the clip keeps it bounded
                     u = soft_clip(u)
@@ -406,8 +431,16 @@ class VideoEcho:
             wet = mix_lab(*wet, gain=self.wet_gain) if phase else self.wet_gain * wet
             if hot:
                 wet = soft_clip(wet)
+            if p.qblur > 0 and p.qblur_on == "echoes":           # the trails dissolve; the dry clip stays sharp
+                wet = self._qblur(wet, n, p.qblur)
             yield self._blend(x, wet)
             n += 1
+
+    def _qblur(self, img, n, xi, salt=0):
+        p = self.p
+        rng = np.random.default_rng([p.stutter_seed, n, salt]) if p.qblur_shots else None
+        return blur_frame(np.maximum(img, 0), xi, size=p.qblur_size, reach=p.qblur_reach, style=p.qblur_style,
+                          mode=p.qblur_mode, scale=p.qblur_scale, width=p.qblur_width, shots=p.qblur_shots, rng=rng)
 
     def _blend(self, x, w):
         p, m = self.p, self.p.mix

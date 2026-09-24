@@ -188,7 +188,7 @@ details summary:focus-visible{outline:2px solid var(--ink);outline-offset:3px;bo
 #modes button[aria-pressed="true"]::before, .keyrow button[aria-pressed="true"]::before{content:"";position:absolute;top:15px;left:50%;width:11px;height:11px;margin-left:-5.5px;border-radius:50%;
   background:radial-gradient(circle at 40% 35%,var(--accent-hi),var(--accent) 60%,var(--accent-lo));box-shadow:0 1px 1px rgba(0,0,0,.25)}
 #modes button:focus-visible, .keyrow button:focus-visible{outline:2px solid var(--ink);outline-offset:-6px}
-.keyrow{grid-template-columns:repeat(3,1fr)}
+.keyrow{grid-template-columns:repeat(4,1fr)}
 .keyrow.five{grid-template-columns:repeat(5,1fr)}
 .keyrow.five button{height:44px;font-size:10.5px;padding-bottom:6px}
 .keyrow.five button[aria-pressed="true"]::before{top:9px;width:8px;height:8px;margin-left:-4px}
@@ -463,6 +463,19 @@ td.fail{color:var(--red)}
     <div class="row"><label for="fb_zoom">loop zoom</label><input type="range" id="fb_zoom" min="-0.2" max="0.2" step="0.01" value="0"><output for="fb_zoom"></output></div>
     <div class="row"><label for="fb_spin">loop spin</label><input type="range" id="fb_spin" min="-15" max="15" step="0.5" value="0"><output for="fb_spin"></output></div>
     <div class="row"><label for="fb_hue">loop hue</label><input type="range" id="fb_hue" min="0" max="1.5" step="0.05" value="0"><output for="fb_hue"></output></div>
+    <h3>Quantum blur <span class="legend">QuantumBlur · moth-quantum</span></h3>
+    <div class="row"><label for="qblur">amount</label><input type="range" id="qblur" min="0" max="1" step="0.05" value="0"><output for="qblur"></output></div>
+    <div class="row"><label>on</label>
+      <div class="seg" id="qbOn"><button class="te-key sm" data-v="echoes" aria-pressed="true">echoes</button><button class="te-key sm" data-v="depth" aria-pressed="false">by depth</button><button class="te-key sm" data-v="loop" aria-pressed="false">loop</button></div><span></span></div>
+    <div class="row"><label>mode</label>
+      <div class="seg" id="qbMode"><button class="te-key sm" data-v="blur" aria-pressed="true">blur</button><button class="te-key sm" data-v="ghost" aria-pressed="false">ghost</button></div><span></span></div>
+    <div class="row"><label>gate</label>
+      <div class="seg" id="qbStyle"><button class="te-key sm" data-v="rx" aria-pressed="true">rx</button><button class="te-key sm" data-v="ry" aria-pressed="false">ry</button></div><span></span></div>
+    <div class="row"><label for="qblur_reach">reach</label><input type="range" id="qblur_reach" min="0" max="1" step="0.05" value="0"><output for="qblur_reach"></output></div>
+    <div class="row qb-ghost" hidden><label for="qblur_scale">ghost scale</label><input type="range" id="qblur_scale" min="0" max="1" step="0.05" value="0.5"><output for="qblur_scale"></output></div>
+    <div class="row qb-ghost" hidden><label for="qblur_width">ghost spread</label><input type="range" id="qblur_width" min="0.05" max="1" step="0.05" value="0.3"><output for="qblur_width"></output></div>
+    <div class="row"><label for="qblur_size">grid</label><select id="qblur_size" class="field"><option value="32">32 · 10 qubits</option><option value="64">64 · 12 qubits</option><option value="128" selected>128 · 14 qubits</option><option value="256">256 · 16 qubits</option></select><span></span></div>
+    <div class="row"><label for="qblur_shots">readout</label><select id="qblur_shots" class="field"><option value="0">exact</option><option value="256">256 shots</option><option value="1024">1024 shots</option><option value="4096">4096 shots</option><option value="16384">16384 shots</option></select><span></span></div>
       </div>
     </div>
   </section>
@@ -641,6 +654,7 @@ window.addEventListener("dragover", e => { if (hasFiles(e)) e.preventDefault(); 
 window.addEventListener("drop", e => { if (hasFiles(e)) e.preventDefault(); });
 
 /* character: presets set many controls at once; touching any of them afterwards = custom */
+let qblur_on = "echoes", qblur_mode = "blur", qblur_style = "rx";
 let blend = "average", accumulate = "sum", fb_crossfade = false, hidden = {}, PRESETS = {}, preset = null, applying = false;
 const PRESET_HINTS = {
   faithful: "the measured tap map, drawn literally: echoes averaged, as the physics says.",
@@ -648,12 +662,18 @@ const PRESET_HINTS = {
   tunnel: "the feedback loop zooms and turns every pass: an infinite tunnel out of the butterfly site.",
   shatter: "difference blend, negative taps, chromatic split, spin: the frame fractures.",
   strobe: "taps lock to 120 bpm and stutter on the beat: negative flashes.",
-  meltdown: "everything on: loop zoom and hue drift, spin, chroma split, stutter.",
+  meltdown: "everything on: loop zoom and hue drift, spin, chroma split, stutter, quantum blur in the loop.",
+  haze: "light-painting trails, each echo dissolved by QuantumBlur while the clip stays sharp.",
+  ghosts: "quantum ghost mode by depth: older echoes split into displaced quantum copies.",
 };
 function pressGroup(sel, attr, v){ document.querySelectorAll(`${sel} button`).forEach(b => b.setAttribute("aria-pressed", String(b.dataset[attr] === String(v)))); }
 function setBlend(v){ blend = v; pressGroup("#blends", "b", v); }
 function setAccum(v){ accumulate = v; pressGroup("#accum", "v", v); }
 function setFbx(v){ fb_crossfade = !!v; pressGroup("#fbx", "v", v ? "1" : "0"); }
+function setQbOn(v){ qblur_on = v; pressGroup("#qbOn", "v", v); }
+function setQbStyle(v){ qblur_style = v; pressGroup("#qbStyle", "v", v); }
+function setQbMode(v){ qblur_mode = v; pressGroup("#qbMode", "v", v);
+  document.querySelectorAll(".qb-ghost").forEach(r => r.hidden = v !== "ghost"); }
 function markPreset(name){
   preset = name; pressGroup("#presets", "p", name || "");
   $("presetHint").textContent = name ? PRESET_HINTS[name] || "" : "custom: your own mix of settings.";
@@ -667,6 +687,10 @@ function applyPreset(name){
     else if (k === "blend") setBlend(v);
     else if (k === "accumulate") setAccum(v);
     else if (k === "fb_crossfade") setFbx(v);
+    else if (k === "qblur_on") setQbOn(v);
+    else if (k === "qblur_mode") setQbMode(v);
+    else if (k === "qblur_style") setQbStyle(v);
+    else if (el && el.tagName === "SELECT" && k !== "bpm") el.value = String(v);
     else if (k === "bpm") $("bpm").value = v ? String(Math.round(v)) : "";
     else if (el && el.type === "range") { el.value = v; el.dispatchEvent(new Event("input")); }
     else if (k !== "division" || v !== 0.25) hidden[k] = v;   // feedback_source, max_tail_s, division: no control
@@ -682,6 +706,8 @@ async function loadPresets(){
 document.querySelectorAll("#blends button").forEach(b => b.onclick = () => { setBlend(b.dataset.b); markPreset(null); estimate(); });
 document.querySelectorAll("#accum button").forEach(b => b.onclick = () => { setAccum(b.dataset.v); markPreset(null); estimate(); });
 document.querySelectorAll("#fbx button").forEach(b => b.onclick = () => { setFbx(b.dataset.v === "1"); markPreset(null); estimate(); });
+for (const [id, fn] of [["#qbOn", setQbOn], ["#qbMode", setQbMode], ["#qbStyle", setQbStyle]])
+  document.querySelectorAll(`${id} button`).forEach(b => b.onclick = () => { fn(b.dataset.v); markPreset(null); estimate(); });
 document.querySelectorAll("aside.right input, aside.right select, #character input, #character select").forEach(el =>
   el.addEventListener("input", () => { if (!applying && preset) markPreset(null); }));
 document.querySelectorAll("#modes button").forEach(b => b.addEventListener("click", () => { if (!applying && preset) markPreset(null); }));
@@ -696,7 +722,9 @@ function params(){
     grain_frames: +$("grain_frames").value, max_height: +$("max_height").value,
     blend, accumulate, punch: num("punch"), sparsity: +$("sparsity").value, zoom: num("zoom"), spin: num("spin"),
     chroma_split: num("chroma_split"), stutter: num("stutter"), fb_zoom: num("fb_zoom"), fb_spin: num("fb_spin"),
-    fb_hue: num("fb_hue"), fb_crossfade, ...hidden };
+    fb_hue: num("fb_hue"), fb_crossfade,
+    qblur: num("qblur"), qblur_on, qblur_mode, qblur_style, qblur_reach: num("qblur_reach"), qblur_scale: num("qblur_scale"),
+    qblur_width: num("qblur_width"), qblur_size: +$("qblur_size").value, qblur_shots: +$("qblur_shots").value, ...hidden };
   if ($("bpm").value) { p.bpm = +$("bpm").value; p.division = hidden.division ?? 0.25; } else { delete p.bpm; }
   if (p.lattice === "square") p.shape = $("shape").value.split(",").map(Number); else p.n_sites = +$("n_sites").value;
   if ($("kick_site").value !== "") p.kick_site = +$("kick_site").value;
@@ -763,7 +791,7 @@ function loaderFrame(now){
     lx.beginPath(); lx.arc(xk, yk, 2.2, 0, 2*Math.PI); lx.fill();
   }
   lx.font = "11px Inter, Helvetica, Arial, sans-serif"; lx.fillStyle = "rgba(255,255,255,.4)";
-  lx.fillText(`delay line · ${N} taps · decay ${decay.toFixed(2)} · ${mode} · ${preset || "custom"}${echoFile ? " · cross-echo: taps read B" : ""}`, 16, 24);
+  lx.fillText(`delay line · ${N} taps · decay ${decay.toFixed(2)} · ${mode} · ${preset || "custom"}${+$("qblur").value > 0 ? " · quantum blur" : ""}${echoFile ? " · cross-echo: taps read B" : ""}`, 16, 24);
   if (!still.matches) ldRaf = requestAnimationFrame(loaderFrame);
 }
 function loader(on){ cancelAnimationFrame(ldRaf); LD.hidden = !on;

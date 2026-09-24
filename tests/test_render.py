@@ -224,3 +224,40 @@ def test_max_accumulation_never_stacks_copies():
     out = run(ve, frames)
     assert max(float(o.max()) for o in out) <= 0.5 + 1e-5          # never brighter than the brightest source
     assert out[12].mean() > 0.2                                     # but each copy at (near) full strength
+
+
+# ---- QuantumBlur on the echoes ---------------------------------------------------------
+def test_qblur_never_touches_the_dry_clip():
+    rng = np.random.default_rng(4)
+    frames = [rng.random((H, W, 3)).astype(np.float32) for _ in range(20)]
+    ve = VideoEcho(const_ir(0.5), FPS, (H, W), RenderParams(master_s=0.2, mix=0.0, qblur=0.8, qblur_size=16))
+    assert all(np.array_equal(o, f) for o, f in zip(run(ve, frames), frames))
+
+def test_qblur_softens_the_echo_layer():
+    dot = np.zeros((H, W, 3), np.float32); dot[8:10, 14:16] = 1.0
+    hf = lambda img: float(np.abs(np.diff(img[..., 1], axis=1)).sum())      # high-frequency energy
+    plain = run(VideoEcho(const_ir(0.5), FPS, (H, W), RenderParams(master_s=0.3, mix=1.0, spatial_width=0)),
+                [dot] + [np.zeros_like(dot)] * 15)
+    ve = VideoEcho(const_ir(0.5), FPS, (H, W), RenderParams(master_s=0.3, mix=1.0, spatial_width=0, qblur=0.6, qblur_size=32))
+    blurred = run(ve, [dot] + [np.zeros_like(dot)] * 15)
+    d = min(t.delay for t in ve.taps)
+    lit = lambda f: (f[..., 1] > 1e-3).sum()
+    assert lit(blurred[d]) > lit(plain[d])          # light spreads over more pixels
+
+def test_qblur_depth_dissolves_older_echoes_more():
+    ir = const_ir(0.5, n=4, T=4)
+    ve = VideoEcho(ir, FPS, (H, W), RenderParams(master_s=0.4, mix=1.0, spatial_width=0, accumulate="max",
+                                                 qblur=0.8, qblur_on="depth", qblur_size=32))
+    dot = np.zeros((H, W, 3), np.float32); dot[8:10, 14:16] = 1.0
+    out = run(ve, [dot] + [np.zeros_like(dot)] * 25)
+    delays = sorted({t.delay for t in ve.taps})
+    spread = lambda f: (f[..., 1] > 0.05 * f[..., 1].max()).sum() if f[..., 1].max() > 0 else 0
+    assert spread(out[delays[-1]]) > spread(out[delays[0]])
+
+def test_qblur_in_the_loop_stays_bounded_and_seeded():
+    frames = [np.full((H, W, 3), 0.6, np.float32)] * 30
+    mk = lambda: VideoEcho(const_ir(0.5), FPS, (H, W), RenderParams(master_s=0.2, mix=1.0, feedback=0.9, fb_crossfade=True,
+                           feedback_source="all", qblur=0.4, qblur_on="loop", qblur_size=16, qblur_shots=256, max_tail_s=0.5))
+    a, b = run(mk(), frames), run(mk(), frames)
+    assert all(np.isfinite(f).all() and f.max() <= 1 + 1e-6 for f in a)
+    assert all(np.array_equal(x, y) for x, y in zip(a, b))

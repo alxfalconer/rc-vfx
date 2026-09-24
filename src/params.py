@@ -61,6 +61,16 @@ class Params(BaseModel):
     stutter_seed: int = Field(0, ge=0)
     fb_crossfade: bool = Field(False, description="feedback crossfades input with the bus (tunnels) instead of adding")
     accumulate: Literal["sum", "max"] = Field("sum", description="max = each echo copy at full strength, no stacking")
+    # --- QuantumBlur on the echoes (moth-quantum/QuantumBlur, the maths blur-v1 wraps) ---
+    qblur: float = Field(0.0, ge=0, le=1, description="strength: rotation per qubit as a fraction of pi")
+    qblur_on: Literal["echoes", "depth", "loop"] = "echoes"
+    qblur_reach: float = Field(0.0, ge=0, le=1, description="0 local .. 1 non-local (blur-v1 reach)")
+    qblur_style: Literal["rx", "ry"] = "rx"
+    qblur_mode: Literal["blur", "ghost"] = "blur"
+    qblur_scale: float = Field(0.5, ge=0, le=1, description="ghost: displacement scale")
+    qblur_width: float = Field(0.3, ge=0.02, le=2, description="ghost: spread of scales")
+    qblur_size: int = Field(128, ge=16, le=256, description="grid cells on the long side (blur-v1 size)")
+    qblur_shots: int = Field(0, ge=0, le=1_000_000, description="0 = exact; else sampled measurements")
 
     model_config = {"extra": "forbid"}
 
@@ -86,7 +96,8 @@ class Params(BaseModel):
     def render_kwargs(self):
         keys = ("negative_mode master_s bpm division decay mix spatial_width drift grain_frames "
                 "feedback feedback_source min_level tail_s max_tail_s blend punch sparsity zoom spin "
-                "fb_zoom fb_spin fb_hue chroma_split stutter stutter_seed fb_crossfade accumulate").split()
+                "fb_zoom fb_spin fb_hue chroma_split stutter stutter_seed fb_crossfade accumulate qblur qblur_on qblur_reach qblur_style qblur_mode qblur_scale "
+                "qblur_width qblur_size qblur_shots").split()
         return {k: getattr(self, k) for k in keys}
 
 
@@ -108,7 +119,9 @@ ERROR_CODES = {
 # measured tap map is drawn. `faithful` is the renderer's own defaults.
 _OFF = dict(blend="average", punch=0.0, sparsity=0, zoom=0.0, spin=0.0, fb_zoom=0.0, fb_spin=0.0, fb_hue=0.0,
             chroma_split=0.0, stutter=0.0, bpm=None, division=0.25, drift=0.0, feedback=0.0,
-            feedback_source="kick", max_tail_s=10.0, fb_crossfade=False, accumulate="sum")
+            feedback_source="kick", max_tail_s=10.0, fb_crossfade=False, accumulate="sum",
+            qblur=0.0, qblur_on="echoes", qblur_reach=0.0, qblur_style="rx", qblur_mode="blur", qblur_scale=0.5,
+            qblur_width=0.3, qblur_size=128, qblur_shots=0)
 PRESETS = {
     "faithful": {**_OFF, "negative_mode": "invert", "mix": 0.5, "decay": 0.82, "master_s": 2.0,
                  "spatial_width": 1.0, "grain_frames": 6},
@@ -127,5 +140,12 @@ PRESETS = {
     "meltdown": {**_OFF, "negative_mode": "reverse", "blend": "screen", "accumulate": "max", "sparsity": 10,
                  "mix": 1.0, "decay": 0.95, "master_s": 1.5, "spatial_width": 0.0, "grain_frames": 8, "zoom": 0.6,
                  "spin": 0.8, "feedback": 0.85, "feedback_source": "all", "fb_zoom": 0.05, "fb_spin": 4.0,
-                 "fb_hue": 0.5, "chroma_split": 0.7, "stutter": 0.4, "fb_crossfade": True, "max_tail_s": 3.0},
+                 "fb_hue": 0.5, "chroma_split": 0.7, "stutter": 0.4, "fb_crossfade": True, "max_tail_s": 3.0, "qblur": 0.3, "qblur_on": "loop", "qblur_reach": 0.3},
+    "haze":     {**_OFF, "negative_mode": "invert", "accumulate": "max", "sparsity": 6, "mix": 0.7,
+                 "decay": 0.97, "master_s": 3.0, "spatial_width": 0.0, "grain_frames": 6,
+                 "qblur": 0.35, "qblur_on": "echoes", "qblur_reach": 0.0, "qblur_size": 128},
+    "ghosts":   {**_OFF, "negative_mode": "invert", "accumulate": "max", "sparsity": 6, "mix": 0.9,
+                 "decay": 0.97, "master_s": 2.5, "spatial_width": 0.0, "grain_frames": 6,
+                 "qblur": 0.5, "qblur_on": "depth", "qblur_mode": "ghost", "qblur_scale": 0.6,
+                 "qblur_width": 0.25, "qblur_size": 128, "qblur_shots": 0}
 }
