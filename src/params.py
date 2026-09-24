@@ -83,4 +83,5 @@ ERROR_CODES = {
     "moth_unauthorized": "No Moth API key applied, or Moth rejected it.",
     "moth_unavailable": "The Moth API could not be reached, or is rate limiting.",
     "moth_failed": "The Moth measurement job failed or returned no readable trajectory.",
+    "timeout": "Serverless only: the render would not finish inside the function time limit."
 }

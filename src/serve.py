@@ -13,7 +13,7 @@ from dataclasses import asdict
 
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 import httpx
 from pydantic import BaseModel, ValidationError
 
@@ -174,8 +174,10 @@ def _set(jid, **kw):
 
 
 def _run(jid: str, p: Params, video_path: pathlib.Path, ir: EchoIR | None, moth_opts: dict | None = None,
-         echo_path: pathlib.Path | None = None, moth_key: str | None = None, d: pathlib.Path | None = None):
+         echo_path: pathlib.Path | None = None, moth_key: str | None = None, d: pathlib.Path | None = None,
+         deadline: float | None = None):
     d = d or ROOT / jid
+    max_fps = float(os.environ.get("RCV_MAX_FPS", 30 if os.environ.get("VERCEL") else 0)) or None
     try:
         _set(jid, status="running", stage="measuring" if ir is None else "loading ir")
         ir_supplied = ir is not None
@@ -184,7 +186,7 @@ def _run(jid: str, p: Params, video_path: pathlib.Path, ir: EchoIR | None, moth_
                               lambda st, prog: _set(jid, stage=f"moth · {st}", progress=0.0), key=moth_key)
         elif ir is None:
             ir = _measure(p)
-        info, frames = read_frames(str(video_path), max_height=p.max_height, max_seconds=MAX_INPUT_S)
+        info, frames = read_frames(str(video_path), max_height=p.max_height, max_seconds=MAX_INPUT_S, max_fps=max_fps)
         echo_frames, echo_s = None, 0.0
         if echo_path is not None:          # cross-echo: B feeds the taps, fitted to A's frame
             einfo, echo_frames = read_frames(str(echo_path), max_seconds=MAX_INPUT_S,
@@ -204,6 +206,10 @@ def _run(jid: str, p: Params, video_path: pathlib.Path, ir: EchoIR | None, moth_
             w.write(f)
             if i % 5 == 0:
                 _set(jid, frames_done=i + 1, progress=min(0.99, (i + 1) / total))
+                if deadline and time.time() > deadline:     # serverless: fail loudly before the platform kills us
+                    w.close()
+                    raise EngineError("timeout", f"ran out of time at {100 * (i + 1) // total}% ({i + 1}/{total} frames). "
+                                      "Try a shorter clip, a lower max height, or a shorter master delay.")
         n_out = w.close()
         if n_out == 0:
             raise EngineError("invalid_video", "no frames decoded")
@@ -334,10 +340,54 @@ def _blob_put(path: str, data: bytes, content_type: str) -> str:
                multipart=len(data) > (50 << 20)).url
 
 
+RENDER_BUDGET_S = float(os.environ.get("RCV_RENDER_BUDGET_S", 270 if os.environ.get("VERCEL") else 0))
+
+
 @app.post("/render")
 def render_now(req: RenderRequest, x_moth_key: str | None = Header(None)):
+    """Validate, then stream NDJSON: progress lines while it works, then {"job": ...} or {"error": ...}."""
     p = _parse_params(req.params)
-    jid = uuid.uuid4().hex
+    for u in filter(None, (req.video_url, req.echo_url, req.ir_url)):
+        if not BLOB_URL.match(u):                        # never fetch arbitrary URLs (SSRF)
+            raise EngineError("invalid_video", "files must come from this app's Blob store")
+    if req.moth is not None and req.ir is None and not req.ir_url and not moth.resolve(x_moth_key):
+        raise EngineError("moth_unauthorized", "No Moth key applied; add one with the key button.", 401)
+    jid, box = uuid.uuid4().hex, {}
+    deadline = time.time() + RENDER_BUDGET_S if RENDER_BUDGET_S else None
+    with LOCK:
+        JOBS[jid] = {"id": jid, "status": "running", "stage": "fetching clips", "progress": 0.0, "created": time.time()}
+
+    def work():
+        try:
+            box["job"] = _render_blob(jid, p, req, x_moth_key, deadline)
+        except (EngineError, moth.MothError) as e:
+            box["error"] = {"code": e.code, "message": e.message}
+        except Exception as e:
+            traceback.print_exc()
+            box["error"] = {"code": "render_failed", "message": f"{type(e).__name__}: {e}"}
+
+    def stream():
+        t = threading.Thread(target=work, daemon=True); t.start()
+        last = None
+        try:
+            while t.is_alive():
+                t.join(0.8)
+                with LOCK:
+                    j = JOBS.get(jid) or {}
+                    snap = {k: j.get(k) for k in ("stage", "progress", "frames_done", "frames_total", "taps")}
+                if snap != last:
+                    last = snap; yield json.dumps({"progress": snap}) + "\n"
+                else:
+                    yield "\n"                                  # keep-alive
+            yield json.dumps({"job": box["job"]} if "job" in box else {"error": box.get("error") or
+                             {"code": "render_failed", "message": "render ended without a result"}}) + "\n"
+        finally:
+            with LOCK:
+                JOBS.pop(jid, None)
+    return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
+
+
+def _render_blob(jid: str, p: Params, req: RenderRequest, x_moth_key: str | None, deadline: float | None) -> dict:
     d = pathlib.Path(tempfile.mkdtemp(prefix=f"rcv-{jid[:8]}-"))
     try:
         ir_obj = None
@@ -357,21 +407,21 @@ def render_now(req: RenderRequest, x_moth_key: str | None = Header(None)):
                 probe(str(f))
             except Exception:
                 raise EngineError("invalid_video", "could not read a video stream in an uploaded clip")
+        _set(jid, stage="queued",
+             ir_source="reference" if req.ir_url else ("upload" if req.ir is not None else ("moth" if mo is not None else "measured")),
+             cross_echo=echo_src is not None)
+        _run(jid, p, src, ir_obj, mo, echo_src, key, d=d, deadline=deadline)
         with LOCK:
-            JOBS[jid] = {"id": jid, "status": "running", "stage": "queued", "progress": 0.0, "created": time.time(),
-                         "ir_source": "reference" if req.ir_url else ("upload" if req.ir is not None else ("moth" if mo is not None else "measured")),
-                         "cross_echo": echo_src is not None}
-        _run(jid, p, src, ir_obj, mo, echo_src, key, d=d)
-        with LOCK:
-            j = JOBS.pop(jid)
+            j = dict(JOBS[jid])
         if j["status"] == "succeeded":
+            _set(jid, stage="saving outputs")
             urls = {slot: _blob_put(f"renders/{jid}/{name}", (d / name).read_bytes(), mime) for slot, (name, mime) in FILES.items()}
             j["result"]["data"]["files"] = urls
             j["result"]["data"]["ir_ref"] = urls["ir"]
+        elif j.get("error"):
+            raise EngineError(j["error"]["code"], j["error"]["message"])
         return j
     finally:
-        with LOCK:
-            JOBS.pop(jid, None)
         shutil.rmtree(d, ignore_errors=True)
 
 

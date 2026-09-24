@@ -659,15 +659,38 @@ async function renderServerless(){
     if (src === "upload" && $("irfile").files[0]) body.ir = JSON.parse(await $("irfile").files[0].text());
     if (src === "job" && $("irref").value) body.ir_url = $("irref").value;
     if (src === "moth") body.moth = mothOpts();
-    readout(0, true); $("status").innerHTML = src === "moth" ? "measuring on moth, then rendering…" : "rendering…";
+    readout(0, true); $("status").innerHTML = src === "moth" ? "measuring on moth…" : "starting…";
     const r = await api("/render", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
-    const j = await r.json().catch(() => ({error: {code: r.status === 504 ? "timeout" : "render_failed",
-      message: r.status === 504 ? "the render ran past the function time limit; try a shorter clip or lower max height" : `server error ${r.status}`}}));
-    if (j.id) { localJobs.add(j); refreshJobs(); }
-    if (!r.ok || j.status !== "succeeded") {
-      const e = j.error || {}; readout(0, false);
-      $("status").innerHTML = `<span class="err">${e.code || r.status}: ${e.message || "render failed"}</span>`; return;
+    if (!r.ok) {                                     // rejected before any work started (bad params, no key, ...)
+      const e = (await r.json().catch(() => ({}))).error || {};
+      readout(0, false); $("status").innerHTML = `<span class="err">${e.code || r.status}: ${e.message || "request failed"}</span>`; return;
     }
+    /* NDJSON: {"progress": {...}} lines while it works, then {"job": ...} or {"error": ...} */
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "", j = null, err = null;
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.job) j = ev.job;
+        else if (ev.error) err = ev.error;
+        else if (ev.progress) {
+          const g = ev.progress;
+          readout(g.progress || 0, true);
+          if (g.taps) $("rTaps").textContent = g.taps;
+          if (g.frames_total) $("rFrames").textContent = `${g.frames_done || 0}/${g.frames_total}`;
+          $("status").innerHTML = g.stage || "working…";
+        }
+      }
+    }
+    if (!j && !err) err = {code: "interrupted", message: "the render stopped before finishing (it may have hit the function's time or memory limit); try a shorter clip or a lower max height"};
+    if (err) { readout(0, false); $("status").innerHTML = `<span class="err">${err.code}: ${err.message}</span>`; return; }
+    localJobs.add(j); refreshJobs();
     readout(1, false);
     $("rTaps").textContent = j.taps ?? "—"; $("rFrames").textContent = j.frames_total ? `${j.frames_done}/${j.frames_total}` : "—";
     $("rTime").textContent = j.render_s ? `${j.render_s}s` : "—";

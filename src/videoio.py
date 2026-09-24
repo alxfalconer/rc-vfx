@@ -40,10 +40,13 @@ def probe(path):
             "duration": float(j["format"].get("duration", 0))}
 
 
-def read_frames(path, max_height=720, max_seconds=30, size=None, fps=None):
+def read_frames(path, max_height=720, max_seconds=30, size=None, fps=None, max_fps=None):
     """size=(W, H) forces an exact frame size (scale to cover, centre-crop) and fps resamples:
-    how a cross-echo clip is fitted to the dry clip, frame for frame."""
+    how a cross-echo clip is fitted to the dry clip, frame for frame. max_fps caps the rate
+    (serverless: 60 fps phone clips are resampled to 30, halving the work)."""
     info = probe(path)
+    if max_fps and not fps and info["fps"] > max_fps + 0.5:
+        fps = max_fps
     W, H = info["width"], info["height"]
     if size:
         W, H = size
@@ -51,8 +54,8 @@ def read_frames(path, max_height=720, max_seconds=30, size=None, fps=None):
     else:
         if H > max_height:                     # v1 caps the frame buffer, not the user
             W, H = int(round(W * max_height / H / 2)) * 2, max_height
-        vf = f"scale={W}:{H}"
-    info.update(width=W, height=H)
+        vf = f"scale={W}:{H}" + (f",fps={fps}" if fps else "")
+    info.update(width=W, height=H, **({"fps": float(fps)} if fps else {}))
     cmd = [FFMPEG, "-v", "error", "-i", path, "-t", str(max_seconds), "-vf", vf,
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)

@@ -30,9 +30,21 @@ def blob(monkeypatch):
     return store
 
 
-def test_render_in_one_call_returns_blob_urls(blob):
-    r = C.post("/render", json={"params": FAST, "video_url": BLOB + "clips/a.mp4"})
-    j = r.json(); assert r.status_code == 200 and j["status"] == "succeeded", j
+def render(body):
+    """POST /render and read the NDJSON stream: returns (progress events, final job or error)."""
+    r = C.post("/render", json=body)
+    if r.headers["content-type"].startswith("application/json"):
+        return r, [], r.json()
+    lines = [json.loads(l) for l in r.text.splitlines() if l.strip()]
+    return r, [l["progress"] for l in lines if "progress" in l], lines[-1]
+
+
+def test_render_streams_progress_then_blob_urls(blob):
+    r, prog, last = render({"params": FAST, "video_url": BLOB + "clips/a.mp4"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("application/x-ndjson")
+    j = last["job"]; assert j["status"] == "succeeded", last
+    stages = {e["stage"] for e in prog}
+    assert "rendering" in stages and any((e.get("frames_total") or 0) > 0 for e in prog)
     files = j["result"]["data"]["files"]
     assert set(files) == {"video", "ir", "taps", "spacetime"} and all(u.startswith(BLOB) for u in files.values())
     assert blob[files["video"]][4:8] == b"ftyp" and blob[files["spacetime"]][:4] == b"\x89PNG"
@@ -40,15 +52,15 @@ def test_render_in_one_call_returns_blob_urls(blob):
 
 
 def test_reuse_ir_url_and_cross_echo(blob):
-    first = C.post("/render", json={"params": FAST, "video_url": BLOB + "clips/a.mp4"}).json()
-    r = C.post("/render", json={"params": FAST, "video_url": BLOB + "clips/a.mp4", "echo_url": BLOB + "clips/b.mp4",
-                                "ir_url": first["result"]["data"]["ir_ref"]}).json()
+    first = render({"params": FAST, "video_url": BLOB + "clips/a.mp4"})[2]["job"]
+    r = render({"params": FAST, "video_url": BLOB + "clips/a.mp4", "echo_url": BLOB + "clips/b.mp4",
+                "ir_url": first["result"]["data"]["ir_ref"]})[2]["job"]
     assert r["status"] == "succeeded" and r["ir_source"] == "reference" and r["cross_echo"], r
 
 
 def test_inline_ir_upload(blob):
     ir = serve._measure(serve.Params(**FAST)).to_trajectory()
-    j = C.post("/render", json={"params": FAST, "video_url": BLOB + "clips/a.mp4", "ir": json.loads(json.dumps(ir))}).json()
+    j = render({"params": FAST, "video_url": BLOB + "clips/a.mp4", "ir": json.loads(json.dumps(ir))})[2]["job"]
     assert j["status"] == "succeeded" and j["ir_source"] == "upload"
 
 
@@ -65,3 +77,23 @@ def test_moth_needs_a_key(blob):
 def test_bad_params_are_typed(blob):
     r = C.post("/render", json={"params": {"mix": 3}, "video_url": BLOB + "clips/a.mp4"})
     assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_params"
+
+
+def test_time_budget_fails_loudly(blob, monkeypatch):
+    monkeypatch.setattr(serve, "RENDER_BUDGET_S", 1e-6)                 # already past the deadline
+    r, prog, last = render({"params": FAST, "video_url": BLOB + "clips/a.mp4"})
+    assert last["error"]["code"] == "timeout" and "ran out of time" in last["error"]["message"], last
+
+
+def test_render_failure_is_a_final_error_line(blob):
+    r, prog, last = render({"params": {**FAST, "min_level": 1.0}, "video_url": BLOB + "clips/a.mp4"})
+    assert last["error"]["code"] == "no_live_taps", last
+
+
+def test_fps_cap_resamples(tmp_path):
+    import videoio, subprocess
+    src = tmp_path / "hi.mp4"
+    subprocess.run([videoio.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=60", "-t", "1",
+                    "-pix_fmt", "yuv420p", str(src)], check=True)
+    info, frames = videoio.read_frames(str(src), max_fps=30)
+    assert info["fps"] == 30.0 and 28 <= sum(1 for _ in frames) <= 32
